@@ -1,0 +1,6 @@
+temp_repos/
+.venv/
+venv/
+__pycache__/
+.env
+target/

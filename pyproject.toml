@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=82.0.0", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-remediation-factory"
+version = "0.1.0"
+description = "Autonomous CVE remediation engine for Java applications"
+requires-python = ">=3.11"
+dependencies = [
+    "docker>=7.1.0",        # To manage the sandbox
+    "GitPython>=3.1.43",    # For repo operations
+    "pydantic>=2.10.0",     # For structured agent data
+    "python-dotenv>=1.0.1"  # For secret management
+]
+
+[project.scripts]
+remediate = "orchestrator.main:main"
