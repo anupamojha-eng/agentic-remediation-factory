@@ -1,4 +1,5 @@
 import docker
+import json
 import os
 from github import Github, Auth
 from remediator import RemediationActor
@@ -11,6 +12,19 @@ class RemediationFactory:
         self.gh_token = os.getenv("GITHUB_TOKEN")
         if not self.gh_token:
             print("WARNING: GITHUB_TOKEN not found in environment.")
+
+    def build_sandbox(self):
+        """Build the cve-fixer-sandbox image from sandbox/Dockerfile."""
+        sandbox_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sandbox"
+        )
+        print(f"Building sandbox image from {sandbox_dir} ...")
+        image, logs = self.client.images.build(path=sandbox_dir, tag=self.image_tag, rm=True)
+        for chunk in logs:
+            if "stream" in chunk:
+                print(chunk["stream"], end="", flush=True)
+        print(f"Sandbox image ready: {self.image_tag}")
+        return image
 
     def execute_ephemeral_fix(self, upstream_url: str, target_tag: str):
         gemini_key = os.getenv("GEMINI_API_KEY")
@@ -62,8 +76,12 @@ class RemediationFactory:
             print(f"Detected build system: {build_system} ({build_file})")
 
             actor = RemediationActor(container, fork, build_system, build_file)
-            cves = self._scan_internal(container)
-            if cves and actor.autonomous_patch(cves):
+            cves = self._scan_internal(container, workspace)
+            if not cves:
+                print("No vulnerabilities found — nothing to remediate.")
+                return
+
+            if actor.autonomous_patch(cves):
                 verify_cmd = self._get_verify_command(build_system, container, workspace)
                 print(f"Verifying build with: {verify_cmd}")
                 verify = container.exec_run(verify_cmd, workdir=workspace)
@@ -92,7 +110,48 @@ class RemediationFactory:
             return "./gradlew compileJava"
         return "gradle compileJava"
 
-    def _scan_internal(self, container):
-        container.exec_run("osv-scanner -j .", workdir="/home/agent/workspace")
-        # TODO: parse OSV-Scanner JSON output; using known ID for now
-        return ["GHSA-3mc7-4q67-5847"]
+    def _scan_internal(self, container, workspace="/home/agent/workspace"):
+        # OSV-Scanner exits 0 = clean, 1 = vulnerabilities found, >1 = error.
+        # Use demux=True to keep stdout (JSON) separate from stderr (progress logs).
+        scan = container.exec_run(
+            "osv-scanner --format json .",
+            workdir=workspace,
+            demux=True
+        )
+        stdout, stderr = scan.output
+
+        if scan.exit_code > 1:
+            err_msg = stderr.decode("utf-8", errors="replace") if stderr else "(no stderr)"
+            print(f"OSV-Scanner error (exit {scan.exit_code}): {err_msg[:300]}")
+            return []
+
+        if not stdout:
+            print("OSV-Scanner produced no output.")
+            return []
+
+        raw = stdout.decode("utf-8", errors="replace").strip()
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f"Failed to parse OSV-Scanner JSON: {e}\nRaw output: {raw[:300]}")
+            return []
+
+        ghsa_ids = set()
+        for result in data.get("results", []):
+            for pkg in result.get("packages", []):
+                for vuln in pkg.get("vulnerabilities", []):
+                    vid = vuln.get("id", "")
+                    if vid.startswith("GHSA-"):
+                        ghsa_ids.add(vid)
+                    # Collect GHSA aliases too (e.g., when primary ID is a CVE)
+                    for alias in vuln.get("aliases", []):
+                        if alias.startswith("GHSA-"):
+                            ghsa_ids.add(alias)
+
+        if ghsa_ids:
+            print(f"Vulnerabilities found: {', '.join(sorted(ghsa_ids))}")
+        else:
+            print("OSV-Scanner found no GHSA vulnerabilities.")
+
+        return sorted(ghsa_ids)
