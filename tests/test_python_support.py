@@ -144,49 +144,36 @@ class TestPythonEcosystem:
 # ── Python pattern detection ──────────────────────────────────────────────────
 
 class TestPythonPatterns:
-    def test_always_includes_yaml_load_for_python(self):
-        with patch('llm_client.genai'):
-            from llm_client import SecurityAgentClient
-            client = SecurityAgentClient.__new__(SecurityAgentClient)
-            client.model_id = "test"
-            client.client = MagicMock()
-            client.client.models.generate_content.return_value.text = "[]"
+    """
+    Tests exercise get_vulnerable_patterns() via known-pattern lookups only —
+    no LLM call is made, so no provider setup is needed.
+    SecurityAgentClient.__new__() bypasses __init__() intentionally.
+    """
 
-            patterns = client.get_vulnerable_patterns([], build_system="python")
-            assert "yaml.load(" in patterns
+    def _make_client(self):
+        from llm_client import SecurityAgentClient
+        client = SecurityAgentClient.__new__(SecurityAgentClient)
+        # llm provider is not needed: all test inputs hit the known-pattern map
+        # or the python always-check list before reaching self.llm.generate().
+        client.llm = MagicMock()
+        return client
+
+    def test_always_includes_yaml_load_for_python(self):
+        from llm_client import SecurityAgentClient
+        patterns = self._make_client().get_vulnerable_patterns([], build_system="python")
+        assert "yaml.load(" in patterns
 
     def test_always_includes_pickle_for_python(self):
-        with patch('llm_client.genai'):
-            from llm_client import SecurityAgentClient
-            client = SecurityAgentClient.__new__(SecurityAgentClient)
-            client.model_id = "test"
-            client.client = MagicMock()
-            client.client.models.generate_content.return_value.text = "[]"
-
-            patterns = client.get_vulnerable_patterns([], build_system="python")
-            assert "pickle.loads(" in patterns
+        patterns = self._make_client().get_vulnerable_patterns([], build_system="python")
+        assert "pickle.loads(" in patterns
 
     def test_known_pyyaml_ghsa_maps_to_yaml_load(self):
-        with patch('llm_client.genai'):
-            from llm_client import SecurityAgentClient
-            client = SecurityAgentClient.__new__(SecurityAgentClient)
-            client.model_id = "test"
-            client.client = MagicMock()
-
-            patterns = client.get_vulnerable_patterns(
-                ["GHSA-8q59-q68h-6hv4"], build_system="python"
-            )
-            assert "yaml.load(" in patterns
+        patterns = self._make_client().get_vulnerable_patterns(
+            ["GHSA-8q59-q68h-6hv4"], build_system="python"
+        )
+        assert "yaml.load(" in patterns
 
     def test_java_patterns_not_included_for_python_project(self):
-        with patch('llm_client.genai'):
-            from llm_client import SecurityAgentClient
-            client = SecurityAgentClient.__new__(SecurityAgentClient)
-            client.model_id = "test"
-            client.client = MagicMock()
-            client.client.models.generate_content.return_value.text = "[]"
-
-            patterns = client.get_vulnerable_patterns([], build_system="python")
-            # Java-specific patterns should not appear in Python-only scan
-            assert "new Yaml()" not in patterns
-            assert "enableDefaultTyping" not in patterns
+        patterns = self._make_client().get_vulnerable_patterns([], build_system="python")
+        assert "new Yaml()" not in patterns
+        assert "enableDefaultTyping" not in patterns
