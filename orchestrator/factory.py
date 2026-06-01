@@ -11,6 +11,15 @@ MAX_PATCH_ATTEMPTS = 3
 # OSV batch API endpoint
 _OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
 
+# OSV ecosystem per build system
+_ECOSYSTEM = {
+    "maven":  "Maven",
+    "gradle": "Maven",
+    "python": "PyPI",
+    "go":     "Go",
+    "rust":   "crates.io",
+}
+
 
 class RemediationFactory:
     def __init__(self):
@@ -78,13 +87,11 @@ class RemediationFactory:
 
             build_system, build_file = self._detect_build_system(container, workspace)
             if not build_system:
-                print("Error: No supported build file found (pom.xml / build.gradle / build.gradle.kts)")
+                print("Error: No supported build file found")
                 return None
             print(f"Detected build system: {build_system} ({build_file})")
 
             actor = RemediationActor(container, fork, build_system, build_file)
-
-            # Use full transitive-dep scanning (OSV API) first, fall back to file scanner
             cves = self._scan_internal(container, workspace, build_system)
             if not cves:
                 print("No vulnerabilities found — nothing to remediate.")
@@ -95,8 +102,8 @@ class RemediationFactory:
 
             for attempt in range(1, MAX_PATCH_ATTEMPTS + 1):
                 if attempt > 1:
-                    if self._is_java_compile_error(build_error):
-                        print(f"Retry {attempt}/{MAX_PATCH_ATTEMPTS}: Java compile errors — keeping build file, re-patching sources...")
+                    if self._is_source_compile_error(build_error, build_system):
+                        print(f"Retry {attempt}/{MAX_PATCH_ATTEMPTS}: source errors — keeping build file, re-patching sources...")
                     else:
                         print(f"Retry {attempt}/{MAX_PATCH_ATTEMPTS}: build file error — restoring and re-patching...")
                         self._restore_build_files(container, workspace, build_system, build_file)
@@ -125,29 +132,26 @@ class RemediationFactory:
     def _scan_internal(self, container, workspace="/home/agent/workspace", build_system=None):
         """
         Two-phase vulnerability scanning:
-        1. Resolve ALL dependencies (direct + transitive) via Maven/Gradle,
+        1. Resolve ALL dependencies (direct + transitive) via build tool,
            then query the OSV REST API — catches transitive CVEs.
         2. Fall back to OSV-Scanner file scan if dep resolution fails.
         """
         print("Resolving full dependency tree (including transitive)...")
+        ecosystem = _ECOSYSTEM.get(build_system, "Maven")
         deps = self._resolve_all_dependencies(container, workspace, build_system)
 
         if deps:
             print(f"  Resolved {len(deps)} dependencies. Querying OSV API...")
-            ghsa_ids = self._query_osv_api(deps)
+            ghsa_ids = self._query_osv_api(deps, ecosystem)
             if ghsa_ids:
                 return ghsa_ids
             print("  OSV API found no vulnerabilities in resolved deps.")
 
-        # Fallback: scan build files directly with OSV-Scanner
         print("Falling back to OSV-Scanner file scan...")
         return self._scan_with_osv_scanner(container, workspace)
 
     def _resolve_all_dependencies(self, container, workspace, build_system) -> list:
-        """
-        Run the build tool's dependency resolution inside the sandbox and return
-        a list of (group:artifact, version) tuples including transitive deps.
-        """
+        """Resolve full dep tree including transitive deps for all supported build systems."""
         if build_system == "maven":
             result = container.exec_run(
                 "mvn dependency:list -DincludeScope=runtime -q",
@@ -157,11 +161,9 @@ class RemediationFactory:
                 deps = self._parse_maven_dep_list(result.output.decode())
                 if deps:
                     return deps
-            # If resolution fails (e.g. compile error in project), still try to parse pom.xml
             print("  mvn dependency:list failed — falling back to declared deps only.")
 
         elif build_system == "gradle":
-            # Gradle dep resolution requires internet and may be slow; try compileClasspath
             result = container.exec_run(
                 "gradle dependencies --configuration compileClasspath --quiet 2>/dev/null",
                 workdir=workspace
@@ -172,13 +174,38 @@ class RemediationFactory:
                     return deps
             print("  gradle dependencies failed — falling back to declared deps only.")
 
+        elif build_system == "python":
+            # Install all deps (including transitive), then list everything installed
+            build_file = "requirements.txt"
+            if container.exec_run("test -f Pipfile", workdir=workspace).exit_code == 0:
+                build_file = "Pipfile"
+            elif container.exec_run("test -f pyproject.toml", workdir=workspace).exit_code == 0:
+                build_file = "pyproject.toml"
+
+            if build_file == "requirements.txt":
+                install_cmd = "pip3 install --user -r requirements.txt -q"
+            elif build_file == "Pipfile":
+                install_cmd = "pip3 install --user pipenv -q && pipenv install -q"
+            else:
+                install_cmd = "pip3 install --user . -q"
+
+            install = container.exec_run(install_cmd, workdir=workspace)
+            if install.exit_code == 0:
+                result = container.exec_run(
+                    ["pip3", "list", "--format=json"],
+                    workdir=workspace
+                )
+                if result.exit_code == 0:
+                    deps = self._parse_python_pip_list(result.output.decode())
+                    if deps:
+                        return deps
+            print("  pip3 install failed — falling back to declared deps only.")
+
         return []
 
     def _parse_maven_dep_list(self, output: str) -> list:
-        """Parse `mvn dependency:list` output into (name, version) tuples."""
         deps = []
         for line in output.splitlines():
-            # [INFO]    group:artifact:type:version:scope
             m = re.match(r'\[INFO\]\s+([^:\s]+):([^:\s]+):[^:]+:([^:]+):[^\s]+', line)
             if m:
                 group, artifact, version = m.group(1), m.group(2), m.group(3)
@@ -186,15 +213,12 @@ class RemediationFactory:
         return deps
 
     def _parse_gradle_dep_tree(self, output: str) -> list:
-        """Parse `gradle dependencies` output into (name, version) tuples."""
         deps = []
         seen = set()
         for line in output.splitlines():
-            # Lines like: +--- org.yaml:snakeyaml:1.28
             m = re.search(r'([a-zA-Z][^:\s]+):([^:\s]+):([^\s\(]+)', line)
             if m:
                 group, artifact, version = m.group(1), m.group(2), m.group(3)
-                # Strip -> markers (version conflict resolution)
                 version = version.rstrip("(*)")
                 key = f"{group}:{artifact}:{version}"
                 if key not in seen and re.match(r'[\d]+\.', version):
@@ -202,19 +226,23 @@ class RemediationFactory:
                     deps.append((f"{group}:{artifact}", version))
         return deps
 
-    def _query_osv_api(self, deps: list) -> list:
-        """
-        Query the OSV batch API for all resolved dependencies.
-        Handles both Maven and generic ecosystems.
-        Returns sorted unique GHSA IDs.
-        """
+    def _parse_python_pip_list(self, output: str) -> list:
+        """Parse `pip3 list --format=json` output into (name, version) tuples."""
+        try:
+            packages = json.loads(output)
+            return [(p["name"], p["version"]) for p in packages]
+        except (json.JSONDecodeError, KeyError):
+            return []
+
+    def _query_osv_api(self, deps: list, ecosystem: str = "Maven") -> list:
+        """Query the OSV batch API for vulnerabilities across the full dep tree."""
         queries = [
-            {"package": {"name": name, "ecosystem": "Maven"}, "version": version}
+            {"package": {"name": name, "ecosystem": ecosystem}, "version": version}
             for name, version in deps
         ]
 
         ghsa_ids = set()
-        chunk_size = 100  # OSV API limit per batch
+        chunk_size = 100
 
         for i in range(0, len(queries), chunk_size):
             batch = queries[i:i + chunk_size]
@@ -286,7 +314,17 @@ class RemediationFactory:
 
     # ── Build system helpers ──────────────────────────────────────────────────
 
-    def _is_java_compile_error(self, build_error: str) -> bool:
+    def _is_source_compile_error(self, build_error: str, build_system: str = None) -> bool:
+        """True when errors are in source files (not in the build file itself)."""
+        if build_system == "python":
+            # Python errors look like:  File "path.py", line N
+            has_py = bool(re.search(r'File ".*\.py"', build_error or ""))
+            has_pkg_error = any(k in (build_error or "") for k in (
+                "No matching distribution", "ERROR: Could not find a version",
+                "ResolutionImpossible"
+            ))
+            return has_py and not has_pkg_error
+        # Java / Groovy
         has_java = bool(re.search(r'\S+\.java:\[?\d+', build_error or ""))
         has_build_file_parse = any(k in (build_error or "") for k in (
             "Non-parseable POM", "ProjectBuildingException", "Invalid POM",
@@ -304,7 +342,9 @@ class RemediationFactory:
 
     def _extract_build_error(self, raw_output: str) -> str:
         keywords = ("[ERROR]", "[FATAL]", "BUILD FAILURE", "COMPILATION ERROR",
-                    "cannot find symbol", "error:", "package does not exist")
+                    "cannot find symbol", "error:", "package does not exist",
+                    "ERROR:", "Traceback", "SyntaxError", "ImportError",
+                    "No matching distribution")
         lines = raw_output.splitlines()
         error_lines = [l for l in lines if any(k in l for k in keywords)]
         tail = lines[-20:]
@@ -312,17 +352,35 @@ class RemediationFactory:
         return "\n".join(combined[:60])
 
     def _detect_build_system(self, container, workspace):
+        # JVM
         if container.exec_run("test -f pom.xml", workdir=workspace).exit_code == 0:
             return "maven", "pom.xml"
         if container.exec_run("test -f build.gradle.kts", workdir=workspace).exit_code == 0:
             return "gradle", "build.gradle.kts"
         if container.exec_run("test -f build.gradle", workdir=workspace).exit_code == 0:
             return "gradle", "build.gradle"
+        # Python
+        if container.exec_run("test -f requirements.txt", workdir=workspace).exit_code == 0:
+            return "python", "requirements.txt"
+        if container.exec_run("test -f Pipfile", workdir=workspace).exit_code == 0:
+            return "python", "Pipfile"
+        if container.exec_run("test -f pyproject.toml", workdir=workspace).exit_code == 0:
+            return "python", "pyproject.toml"
         return None, None
 
     def _get_verify_command(self, build_system, container, workspace):
         if build_system == "maven":
             return "mvn clean compile"
+        if build_system == "python":
+            # Install deps and run tests if they exist; otherwise just check install
+            has_pytest = container.exec_run(
+                ["bash", "-c", "test -d tests || test -f pytest.ini || test -f setup.cfg"],
+                workdir=workspace
+            ).exit_code == 0
+            if has_pytest:
+                return "pip3 install --user -r requirements.txt -q && python3 -m pytest -q --tb=short 2>&1 || pip3 install --user -r requirements.txt -q"
+            return "pip3 install --user -r requirements.txt -q && pip3 check"
+        # Gradle
         if container.exec_run("test -f gradlew", workdir=workspace).exit_code == 0:
             return "./gradlew compileJava"
         return "gradle compileJava"

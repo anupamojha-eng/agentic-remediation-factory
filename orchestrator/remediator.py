@@ -36,16 +36,17 @@ class RemediationActor:
 
     def get_affected_java_files(self, build_error: str) -> dict:
         """
-        Parse compile errors for absolute Java file paths, read each file from
-        the container, and return {relative_path: content}.
-
-        Included only for files under MAX_SOURCE_FILE_BYTES to keep the LLM
-        prompt tractable.
+        Parse compile/runtime errors for absolute source file paths (.java or .py),
+        read each file from the container, and return {relative_path: content}.
+        Only includes files under MAX_SOURCE_FILE_BYTES to keep the LLM prompt tractable.
         """
-        # Stop at ':' so we don't capture the :[line,col] suffix from Maven errors.
-        abs_paths = re.findall(
-            rf'{re.escape(self.workspace)}(/[^\s:]+\.java)', build_error
-        )
+        # Java: /workspace/.../Foo.java:[line,col]  — stop at ':' to drop line info
+        # Python: File "/workspace/.../foo.py", line N  — stop at '"' to drop quote
+        abs_paths = [
+            m[0] for m in re.findall(
+                rf'{re.escape(self.workspace)}(/[^\s:,"]+\.(java|py))', build_error
+            )
+        ]
         files = {}
         for rel_path in dict.fromkeys(abs_paths):   # deduplicate, preserve order
             abs_path = self.workspace + rel_path
@@ -66,17 +67,18 @@ class RemediationActor:
         grep the source tree for those patterns and return matching file contents.
         This catches insecure usage of vulnerable libraries (transitive or direct).
         """
-        patterns = self.llm.get_vulnerable_patterns(ghsa_ids)
+        patterns = self.llm.get_vulnerable_patterns(ghsa_ids, self.build_system)
         if not patterns:
             return {}
 
+        # Source file extension depends on the language
+        src_ext = "*.py" if self.build_system == "python" else "*.java"
         print(f"  Scanning source tree for exploitable patterns: {patterns}")
         files = {}
         for pattern in patterns[:5]:  # cap to avoid overly broad searches
             # Use list form so Docker exec runs grep directly (no shell needed)
-            # and the pattern is passed safely without shell-escaping issues.
             result = self.container.exec_run(
-                ["grep", "-rl", "--include=*.java", pattern, "src/"],
+                ["grep", "-rl", f"--include={src_ext}", pattern, "."],
                 workdir=self.workspace
             )
             if result.exit_code == 0:

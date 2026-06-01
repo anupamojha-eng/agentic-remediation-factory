@@ -21,6 +21,10 @@ def _is_java_compile_error(build_error: str) -> bool:
     return bool(_re.search(r'\S+\.java:\[?\d+', build_error or ""))
 
 
+def _is_python_error(build_error: str) -> bool:
+    return bool(_re.search(r'File ".*\.py"', build_error or ""))
+
+
 class SecurityAgentClient:
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY")
@@ -30,35 +34,57 @@ class SecurityAgentClient:
         self.client = genai.Client(api_key=api_key)
         self.model_id = "gemini-2.5-flash"
 
-    # Well-known GHSA IDs mapped to the dangerous Java call-site patterns they require.
+    # Well-known GHSA IDs → dangerous call-site grep patterns (Java and Python).
     # Checked first (fast + reliable) before falling back to the LLM for unknowns.
     _KNOWN_PATTERNS: dict = {
-        # jackson-databind polymorphic typing RCE family
+        # ── Java: jackson-databind polymorphic typing RCE ─────────────────────
         "GHSA-jjjh-jjxp-wpff": ["enableDefaultTyping"],
         "GHSA-rgv9-q543-rqg4": ["enableDefaultTyping"],
         "GHSA-3x8x-79m2-3w2w": ["enableDefaultTyping"],
         "GHSA-57j2-w4cx-62h2": ["enableDefaultTyping"],
-        # snakeyaml deserialization RCE family
+        # ── Java: snakeyaml deserialization RCE ──────────────────────────────
         "GHSA-668q-qrv7-99fm": ["new Yaml()"],
         "GHSA-735f-pc8j-v9w8": ["new Yaml()"],
-        # commons-text Text4Shell
+        # ── Java: commons-text Text4Shell ─────────────────────────────────────
         "GHSA-599f-7c49-w659": ["new StringSubstitutor"],
-        # Log4Shell family
+        # ── Java: Log4Shell ───────────────────────────────────────────────────
         "GHSA-jfh8-c2jp-hdp8": ["MDC.put", "ThreadContext.put"],
         "GHSA-7rjr-3q55-vv33": ["MDC.put", "ThreadContext.put"],
-        # Kafka unsafe deserialization
+        # ── Java: Kafka unsafe deserialization ───────────────────────────────
         "GHSA-26f8-x96c-9785": ["new KafkaConsumer", "StringDeserializer"],
         "GHSA-gg5e-p4p8-6hjm": ["Deserializer"],
+        # ── Python: PyYAML unsafe load ────────────────────────────────────────
+        "GHSA-8q59-q68h-6hv4": ["yaml.load("],
+        "GHSA-6q5r-27gj-jm84": ["yaml.load("],
+        "GHSA-rprw-h62v-c2w7": ["yaml.load("],
+        # ── Python: pickle deserialization RCE ───────────────────────────────
+        "GHSA-8mpf-9jhm-48r3": ["pickle.loads(", "pickle.load("],
+        # ── Python: Jinja2 sandbox escape ────────────────────────────────────
+        "GHSA-g3rq-g295-4j3m": ["render_template_string(", "Environment("],
+        "GHSA-h5c8-rqwp-cp95": ["render_template_string("],
     }
 
-    def get_vulnerable_patterns(self, ghsa_ids: list) -> list:
+    # Python-specific dangerous patterns always checked regardless of GHSA IDs.
+    # These cover the most common exploitable patterns in Python projects.
+    _PYTHON_ALWAYS_CHECK: list = [
+        "yaml.load(",
+        "pickle.loads(",
+        "pickle.load(",
+    ]
+
+    def get_vulnerable_patterns(self, ghsa_ids: list, build_system: str = "maven") -> list:
         """
-        Return grep patterns for Java code that makes these CVEs exploitable.
+        Return grep patterns for source files that make these CVEs exploitable.
         Checks the known-pattern map first (fast + reliable), then falls back
         to the LLM for CVEs not in the map.
+        For Python projects, always includes the core dangerous patterns.
         """
         patterns: set = set()
         unknown = []
+
+        # Always include core Python patterns for Python projects
+        if build_system == "python":
+            patterns.update(self._PYTHON_ALWAYS_CHECK)
 
         for ghsa in ghsa_ids:
             if ghsa in self._KNOWN_PATTERNS:
@@ -67,18 +93,18 @@ class SecurityAgentClient:
                 unknown.append(ghsa)
 
         if unknown:
-            prompt = f"""These Java security vulnerabilities were found in a project:
+            lang = "Python" if build_system == "python" else "Java"
+            ext = ".py" if build_system == "python" else ".java"
+            prompt = f"""These {lang} security vulnerabilities were found in a project:
 {unknown}
 
-For each one that is exploitable via a specific dangerous Java code pattern,
-give the grep string that identifies that call site in .java source files.
+For each one that is exploitable via a specific dangerous {lang} code pattern,
+give the grep string that identifies that call site in {ext} source files.
 
-Reference examples:
-  Jackson enableDefaultTyping RCE -> grep: enableDefaultTyping
-  SnakeYAML deserialization RCE   -> grep: new Yaml()
-  Commons-text Text4Shell         -> grep: new StringSubstitutor
-  Log4Shell JNDI via MDC          -> grep: MDC.put
-  Kafka unsafe Deserializer       -> grep: Deserializer
+Reference examples ({lang}):
+  {"PyYAML unsafe load -> grep: yaml.load(" if build_system == "python" else "Jackson enableDefaultTyping RCE -> grep: enableDefaultTyping"}
+  {"pickle deserialization -> grep: pickle.loads(" if build_system == "python" else "SnakeYAML deserialization RCE -> grep: new Yaml()"}
+  {"subprocess shell injection -> grep: shell=True" if build_system == "python" else "Commons-text Text4Shell -> grep: new StringSubstitutor"}
 
 Return ONLY a JSON array of grep strings. [] if purely library-internal."""
 
@@ -195,6 +221,12 @@ Rules:
 - Only change what is necessary to fix the specified vulnerabilities
 - Prefer the minimum version that fixes the vulnerability — avoid unnecessary major upgrades
 - Preserve all formatting, whitespace, comments, and file structure exactly
+- For requirements.txt / Pipfile / pyproject.toml: update version pins to the minimum safe version
+- For *.py source files:
+    - Replace yaml.load(data) or yaml.load(f) with yaml.safe_load(data) / yaml.safe_load(f)
+    - Replace yaml.load(data, Loader=yaml.Loader) with yaml.safe_load(data)
+    - Add a security comment if pickle.loads() cannot be safely removed
+    - Replace subprocess calls with shell=True with list-form when input may be user-controlled
 - For *.java source files: implement missing abstract methods (minimal stub throwing
   UnsupportedOperationException for read-only adapters), fix incompatible type casts,
   and update deprecated/removed API calls. Return the COMPLETE file content.
