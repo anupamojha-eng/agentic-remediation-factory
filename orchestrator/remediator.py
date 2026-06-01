@@ -1,129 +1,90 @@
 import os
-import git
-from llm_client import SecurityAgentClient 
-from github import Github 
+import base64
+from llm_client import SecurityAgentClient
+from github import Github
+
 
 class RemediationActor:
-    def __init__(self, container):
+    def __init__(self, container, fork_object, build_system="maven", build_file="pom.xml"):
         self.container = container
+        self.fork = fork_object
+        self.build_system = build_system
+        self.build_file = build_file
         self.llm = SecurityAgentClient()
+        self.gh_token = os.getenv("GITHUB_TOKEN")
+        self.workspace = "/home/agent/workspace"
 
-    def get_pom_content(self):
-        result = self.container.exec_run("cat pom.xml", workdir="/home/agent/workspace")
-        return result.output.decode()
+    def get_build_files_content(self):
+        """Returns {filename: content} for all build files relevant to patching."""
+        files = {}
+
+        result = self.container.exec_run(f"cat {self.build_file}", workdir=self.workspace)
+        files[self.build_file] = result.output.decode()
+
+        # For Gradle, also include the version catalog if present
+        if self.build_system == "gradle":
+            catalog = "gradle/libs.versions.toml"
+            res = self.container.exec_run(f"cat {catalog}", workdir=self.workspace)
+            if res.exit_code == 0:
+                files[catalog] = res.output.decode()
+
+        return files
 
     def autonomous_patch(self, ghsa_ids, build_error=None):
-        pom_content = self.get_pom_content()
-        plan = self.llm.get_remediation_plan(ghsa_ids, pom_content, build_error)
-        
+        files_content = self.get_build_files_content()
+        plan = self.llm.get_remediation_plan(
+            ghsa_ids, files_content, self.build_system, build_error
+        )
         if not plan:
-            return False 
-            
-        target = plan.get('target_version')
-        parent = plan.get('parent_version')
-        print(f"🤖 AI Decision: Upgrade to {target} (Parent: {parent})")
-        
-        python_patch = f"""
-import xml.etree.ElementTree as ET
-ET.register_namespace('', 'http://maven.apache.org/POM/4.0.0')
-tree = ET.parse('pom.xml')
-root = tree.getroot()
-ns = {{'mvn': 'http://maven.apache.org/POM/4.0.0'}}
+            return False
 
-v = root.find('mvn:version', ns)
-if v is not None: v.text = '{target}'
+        patches = plan.get("patches", {})
+        if not patches:
+            print("LLM returned no patches")
+            return False
 
-p_v = root.find('mvn:parent/mvn:version', ns)
-if p_v is not None and '{parent}':
-    p_v.text = '{parent}'
+        for change in plan.get("changes", []):
+            print(f"  -> {change}")
 
-tree.write('pom.xml', encoding='UTF-8', xml_declaration=True)
-"""
-        escaped_script = python_patch.replace('"', '\\"').replace("'", "'\\''")
-        self.container.exec_run(f"python3 -c \"{escaped_script}\"", workdir="/home/agent/workspace")
+        return all(self._write_file(fname, content) for fname, content in patches.items())
+
+    def _write_file(self, filename, content):
+        parent = os.path.dirname(filename)
+        if parent:
+            self.container.exec_run(f"mkdir -p {parent}", workdir=self.workspace)
+
+        # Pass content via base64 to safely handle all special characters
+        encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        python_code = f"import base64; open('{filename}', 'wb').write(base64.b64decode('{encoded}'))"
+        res = self.container.exec_run(["python3", "-c", python_code], workdir=self.workspace)
+        if res.exit_code != 0:
+            print(f"Failed to write {filename}: {res.output.decode()}")
+            return False
+        print(f"Patched {filename}")
         return True
 
-    def fix_java_version_conflict(self):
-        print("🛠️  Agent is applying a deep patch to pom.xml...")
-        patch_script = (
-            "sed -i 's/<source>.*<\\/source>/<source>17<\\/source>/g' pom.xml && "
-            "sed -i 's/<target>.*<\\/target>/<target>17<\\/target>/g' pom.xml && "
-            "sed -i '/<compilerArgs>/,/<\\/compilerArgs>/d' pom.xml"
-        )
-        self.container.exec_run(f"bash -c \"{patch_script}\"", workdir="/home/agent/workspace")
+    def create_pull_request(self, ghsa_ids):
+        new_branch = f"fix/{'-'.join(ghsa_ids)}"
 
-    def apply_security_patch(self, cve_list):
-        print(f"🧬 Remediating: {', '.join(cve_list)}")
-        python_patch = """
-import xml.etree.ElementTree as ET
+        self.container.exec_run("git config --global user.email 'agent@sentinel.ai'", workdir=self.workspace)
+        self.container.exec_run("git config --global user.name 'Sentinel Agent'", workdir=self.workspace)
+        self.container.exec_run(f"git checkout -b {new_branch}", workdir=self.workspace)
+        self.container.exec_run("git add .", workdir=self.workspace)
+        self.container.exec_run(f"git commit -m 'Security: Automated fix for {ghsa_ids[0]}'", workdir=self.workspace)
 
-ET.register_namespace('', 'http://maven.apache.org/POM/4.0.0')
-tree = ET.parse('pom.xml')
-root = tree.getroot()
-ns = {'mvn': 'http://maven.apache.org/POM/4.0.0'}
+        auth_url = self.fork.clone_url.replace("https://", f"https://{self.gh_token}@")
+        self.container.exec_run(f"git push {auth_url} {new_branch} --force", workdir=self.workspace)
 
-version_node = root.find('mvn:version', ns)
-if version_node is not None:
-    version_node.text = '2.13.4.2'
-
-parent_version = root.find('mvn:parent/mvn:version', ns)
-if parent_version is not None:
-    parent_version.text = '2.13.4'
-
-tree.write('pom.xml', encoding='UTF-8', xml_declaration=True)
-"""
-        escaped_script = python_patch.replace('"', '\\"').replace("'", "'\\''")
-        self.container.exec_run(f"python3 -c \"{escaped_script}\"", workdir="/home/agent/workspace")
-
-    def create_pull_request(self, local_repo_path, ghsa_ids):
-        repo = git.Repo(local_repo_path)
-        new_branch = f"fix/{'-'.join(ghsa_ids[:2])}"
-        
-        print(f"🌿 Preparing branch: {new_branch}")
-        current = repo.create_head(new_branch, force=True)
-        current.checkout()
-        repo.git.add(A=True)
-        repo.index.commit(f"Security: Automated remediation for {ghsa_ids}")
-
-        print(f"⬆️ Pushing branch to origin...")
-        origin = repo.remote(name='origin')
-        origin.push(new_branch, force=True)
-
-        token = os.getenv("GITHUB_TOKEN")
-        if not token:
-            print("❌ GITHUB_TOKEN not found. PR skipped.")
-            return
-
-        g = Github(token)
-        remote_url = origin.url
-        
-        if "github.com:" in remote_url: 
-            repo_full_name = remote_url.split("github.com:")[-1].replace(".git", "")
-        else: 
-            repo_full_name = remote_url.split("github.com/")[-1].replace(".git", "")
-
-        gh_repo = g.get_repo(repo_full_name)
-        
-        # --- DYNAMICALLY RESOLVE DEFAULT BRANCH ---
-        # This fixes the previous NameError and the 422 error[cite: 5]
-        base_branch = gh_repo.default_branch 
-        print(f"🎯 Target base branch resolved: {base_branch}")
-
-        body = (
-            "## 🛡️ Automated Security Remediation\n"
-            f"This PR was generated by the **Sentinel Agent** to address: {', '.join(ghsa_ids)}.\n\n"
-            "### 🧪 Verification\n"
-            "- [x] Version bumped in `pom.xml`\n"
-            "- [x] Verified with `mvn clean compile` in an isolated sandbox.\n"
-        )
+        parent_repo = self.fork.parent
+        body = f"## Automated Security Remediation\nAddresses: {', '.join(ghsa_ids)}"
 
         try:
-            pr = gh_repo.create_pull(
-                title=f"Security: Fix {ghsa_ids[0]} and others",
+            pr = parent_repo.create_pull(
+                title=f"Security: Fix {ghsa_ids[0]}",
                 body=body,
-                head=new_branch,
-                base=base_branch 
+                head=f"{self.fork.owner.login}:{new_branch}",
+                base=parent_repo.default_branch
             )
-            print(f"🚀 SUCCESS: PR Created at {pr.html_url}")
+            print(f"SUCCESS: PR Created at {pr.html_url}")
         except Exception as e:
-            print(f"⚠️ PR creation failed: {e}")
+            print(f"PR creation failed: {e}")

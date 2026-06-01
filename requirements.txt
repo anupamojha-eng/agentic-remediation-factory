@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+docker
+PyGithub
+google-genai
+python-dotenv
+opentelemetry-api
+opentelemetry-sdk

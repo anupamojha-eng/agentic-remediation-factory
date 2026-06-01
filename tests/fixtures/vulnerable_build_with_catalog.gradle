@@ -1,0 +1,17 @@
+plugins {
+    id 'java'
+}
+
+group = 'com.example'
+version = '1.0.0'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // Version is defined in gradle/libs.versions.toml
+    implementation libs.jackson.databind
+    implementation libs.slf4j.api
+    testImplementation libs.junit
+}

@@ -1,0 +1,22 @@
+plugins {
+    id 'java'
+}
+
+group = 'com.example'
+version = '1.0.0'
+
+ext {
+    // GHSA-jjjh-jjxp-wpff / CVE-2022-42003: affected < 2.13.4.2
+    jacksonVersion = '2.13.0'
+    slf4jVersion = '1.7.36'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation "com.fasterxml.jackson.core:jackson-databind:${jacksonVersion}"
+    implementation "org.slf4j:slf4j-api:${slf4jVersion}"
+    testImplementation 'junit:junit:4.13.2'
+}

@@ -1,0 +1,10 @@
+[versions]
+# GHSA-jjjh-jjxp-wpff / CVE-2022-42003: affected < 2.13.4.2
+jackson = "2.13.0"
+slf4j = "1.7.36"
+junit = "4.13.2"
+
+[libraries]
+jackson-databind = { group = "com.fasterxml.jackson.core", name = "jackson-databind", version.ref = "jackson" }
+slf4j-api = { group = "org.slf4j", name = "slf4j-api", version.ref = "slf4j" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
