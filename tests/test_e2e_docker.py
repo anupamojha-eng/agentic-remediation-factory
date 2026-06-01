@@ -1,20 +1,19 @@
 """
 End-to-end tests using a real Docker sandbox container.
 
-These tests prove the full scan → patch → compile cycle works for both
-Maven and Gradle projects without touching GitHub.
+Proves the full scan → patch → compile cycle for Maven, Gradle Groovy,
+and Gradle Kotlin DSL without touching GitHub.
 
 Requirements:
   - Docker daemon running
   - GEMINI_API_KEY set
-  - Sandbox image built (auto-built if absent, takes ~5 min first time)
+  - Sandbox image built (auto-built if absent, ~5 min first time)
 
 Run: pytest tests/test_e2e_docker.py -v -s
 """
-import io
+import base64
 import os
 import sys
-import tarfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -46,7 +45,7 @@ def sandbox_image(docker_client):
     try:
         return docker_client.images.get("cve-fixer-sandbox:latest")
     except docker_module.errors.ImageNotFound:
-        print("\nSandbox image not found — building (this takes ~5 minutes the first time)...")
+        print("\nSandbox image not found — building (~5 min first time)...")
         image, logs = docker_client.images.build(
             path=sandbox_dir, tag="cve-fixer-sandbox:latest", rm=True
         )
@@ -66,7 +65,8 @@ def container(docker_client, sandbox_image):
         tty=True,
         environment={"GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", "")},
     )
-    c.exec_run(f"mkdir -p {WORKSPACE}")
+    # Remove the sandbox's own requirements.txt so it doesn't pollute OSV scans
+    c.exec_run("rm -f requirements.txt", workdir=WORKSPACE)
     yield c
     c.stop()
     c.remove()
@@ -80,16 +80,17 @@ def require_gemini_key():
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def copy_file_to_container(container, workspace, filename, content_bytes):
-    """Transfer a single file into a running container via put_archive."""
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w") as tar:
-        info = tarfile.TarInfo(name=filename)
-        info.size = len(content_bytes)
-        info.mode = 0o644
-        tar.addfile(info, io.BytesIO(content_bytes))
-    buf.seek(0)
-    container.put_archive(workspace, buf)
+def copy_file(container, workspace, filename, content_bytes):
+    """Write a file into the container as the agent user via base64, avoiding
+    ownership issues that arise when put_archive creates root-owned files."""
+    encoded = base64.b64encode(content_bytes).decode("ascii")
+    parent = os.path.dirname(filename)
+    if parent:
+        container.exec_run(f"mkdir -p {parent}", workdir=workspace)
+    python_code = f"import base64; open('{filename}','wb').write(base64.b64decode('{encoded}'))"
+    result = container.exec_run(["python3", "-c", python_code], workdir=workspace)
+    if result.exit_code != 0:
+        raise RuntimeError(f"Failed to copy {filename}: {result.output.decode()}")
 
 
 def make_factory():
@@ -105,21 +106,19 @@ def make_factory():
 class TestMavenEndToEnd:
     @pytest.fixture(autouse=True)
     def _setup(self, require_gemini_key, container):
-        copy_file_to_container(
-            container, WORKSPACE, "pom.xml",
-            (FIXTURES / "vulnerable_pom.xml").read_bytes()
-        )
+        # pom.xml is natively understood by OSV-Scanner — no lock file needed
+        copy_file(container, WORKSPACE, "pom.xml",
+                  (FIXTURES / "vulnerable_pom.xml").read_bytes())
         self.container = container
 
     def test_detects_maven_build_system(self):
-        factory = make_factory()
-        build_system, build_file = factory._detect_build_system(self.container, WORKSPACE)
+        build_system, build_file = make_factory()._detect_build_system(
+            self.container, WORKSPACE)
         assert build_system == "maven"
         assert build_file == "pom.xml"
 
     def test_osv_scanner_finds_cves(self):
-        factory = make_factory()
-        cves = factory._scan_internal(self.container, WORKSPACE)
+        cves = make_factory()._scan_internal(self.container, WORKSPACE)
         assert len(cves) > 0, "OSV-Scanner found no CVEs in vulnerable pom.xml"
         print(f"\n  CVEs found: {cves}")
 
@@ -143,27 +142,29 @@ class TestMavenEndToEnd:
         print(f"\n  Build passed with: {verify_cmd}")
 
 
-# ── Gradle end-to-end ──────────────────────────────────────────────────────────
+# ── Gradle Groovy end-to-end ───────────────────────────────────────────────────
 
 class TestGradleEndToEnd:
     @pytest.fixture(autouse=True)
     def _setup(self, require_gemini_key, container):
-        copy_file_to_container(
-            container, WORKSPACE, "build.gradle",
-            (FIXTURES / "vulnerable_build.gradle").read_bytes()
-        )
+        # OSV-Scanner needs a gradle.lockfile — it does not read build.gradle directly.
+        # The lockfile is ignored by Gradle itself (no dependencyLocking block in fixture),
+        # so compilation after patching works cleanly with the updated build.gradle.
+        copy_file(container, WORKSPACE, "build.gradle",
+                  (FIXTURES / "vulnerable_build.gradle").read_bytes())
+        copy_file(container, WORKSPACE, "gradle.lockfile",
+                  (FIXTURES / "gradle.lockfile").read_bytes())
         self.container = container
 
     def test_detects_gradle_build_system(self):
-        factory = make_factory()
-        build_system, build_file = factory._detect_build_system(self.container, WORKSPACE)
+        build_system, build_file = make_factory()._detect_build_system(
+            self.container, WORKSPACE)
         assert build_system == "gradle"
         assert build_file == "build.gradle"
 
     def test_osv_scanner_finds_cves(self):
-        factory = make_factory()
-        cves = factory._scan_internal(self.container, WORKSPACE)
-        assert len(cves) > 0, "OSV-Scanner found no CVEs in vulnerable build.gradle"
+        cves = make_factory()._scan_internal(self.container, WORKSPACE)
+        assert len(cves) > 0, "OSV-Scanner found no CVEs in gradle.lockfile"
         print(f"\n  CVEs found: {cves}")
 
     def test_full_scan_patch_compile_cycle(self):
@@ -177,11 +178,12 @@ class TestGradleEndToEnd:
         actor = RemediationActor(self.container, MagicMock(), build_system, build_file)
         assert actor.autonomous_patch(cves), "autonomous_patch returned False"
 
-        # Use system gradle (no wrapper in the fixture project)
+        # gradle.lockfile is stale after patching; remove it so Gradle resolves freely
+        self.container.exec_run("rm -f gradle.lockfile", workdir=WORKSPACE)
+
         result = self.container.exec_run("gradle compileJava", workdir=WORKSPACE)
         assert result.exit_code == 0, (
-            f"Build failed after patching.\n"
-            f"Output:\n{result.output.decode()}"
+            f"Build failed after patching.\nOutput:\n{result.output.decode()}"
         )
         print("\n  Build passed with: gradle compileJava")
 
@@ -191,15 +193,15 @@ class TestGradleEndToEnd:
 class TestGradleKtsEndToEnd:
     @pytest.fixture(autouse=True)
     def _setup(self, require_gemini_key, container):
-        copy_file_to_container(
-            container, WORKSPACE, "build.gradle.kts",
-            (FIXTURES / "vulnerable_build.gradle.kts").read_bytes()
-        )
+        copy_file(container, WORKSPACE, "build.gradle.kts",
+                  (FIXTURES / "vulnerable_build.gradle.kts").read_bytes())
+        copy_file(container, WORKSPACE, "gradle.lockfile",
+                  (FIXTURES / "gradle.lockfile").read_bytes())
         self.container = container
 
     def test_detects_gradle_kts_build_system(self):
-        factory = make_factory()
-        build_system, build_file = factory._detect_build_system(self.container, WORKSPACE)
+        build_system, build_file = make_factory()._detect_build_system(
+            self.container, WORKSPACE)
         assert build_system == "gradle"
         assert build_file == "build.gradle.kts"
 
@@ -214,9 +216,10 @@ class TestGradleKtsEndToEnd:
         actor = RemediationActor(self.container, MagicMock(), build_system, build_file)
         assert actor.autonomous_patch(cves), "autonomous_patch returned False"
 
+        self.container.exec_run("rm -f gradle.lockfile", workdir=WORKSPACE)
+
         result = self.container.exec_run("gradle compileJava", workdir=WORKSPACE)
         assert result.exit_code == 0, (
-            f"Build failed after patching.\n"
-            f"Output:\n{result.output.decode()}"
+            f"Build failed after patching.\nOutput:\n{result.output.decode()}"
         )
         print("\n  Build passed with: gradle compileJava")
