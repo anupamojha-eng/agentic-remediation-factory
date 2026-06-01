@@ -7,3 +7,4 @@ google-genai
 python-dotenv
 opentelemetry-api
 opentelemetry-sdk
+requests

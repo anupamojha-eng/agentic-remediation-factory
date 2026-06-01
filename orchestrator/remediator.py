@@ -60,16 +60,52 @@ class RemediationActor:
             print(f"  Including source file: {rel_path.lstrip('/')}")
         return files
 
+    def get_vulnerable_code_files(self, ghsa_ids: list) -> dict:
+        """
+        Ask the LLM which Java code patterns make these CVEs exploitable, then
+        grep the source tree for those patterns and return matching file contents.
+        This catches insecure usage of vulnerable libraries (transitive or direct).
+        """
+        patterns = self.llm.get_vulnerable_patterns(ghsa_ids)
+        if not patterns:
+            return {}
+
+        print(f"  Scanning source tree for exploitable patterns: {patterns}")
+        files = {}
+        for pattern in patterns[:5]:  # cap to avoid overly broad searches
+            result = self.container.exec_run(
+                f"grep -rl '{pattern}' src/ --include='*.java' 2>/dev/null",
+                workdir=self.workspace
+            )
+            if result.exit_code == 0:
+                for path in result.output.decode().splitlines():
+                    path = path.strip()
+                    if not path or path in files:
+                        continue
+                    res = self.container.exec_run(f"cat {path}", workdir=self.workspace)
+                    if res.exit_code != 0:
+                        continue
+                    content = res.output.decode("utf-8", errors="replace")
+                    if len(content.encode()) <= MAX_SOURCE_FILE_BYTES:
+                        files[path] = content
+                        print(f"  Found vulnerable pattern '{pattern}' in: {path}")
+        return files
+
     def autonomous_patch(self, ghsa_ids, build_error=None):
         files_content = self.get_build_files_content()
 
-        # On a retry pass: include the Java files the compiler complained about
-        # so the LLM can fix API incompatibilities in source code too.
         if build_error:
+            # Retry pass: include Java files that the compiler complained about
             java_files = self.get_affected_java_files(build_error)
             if java_files:
                 print(f"  Feeding {len(java_files)} Java source file(s) to LLM for co-patching.")
                 files_content.update(java_files)
+        else:
+            # First pass: proactively search for exploitable code patterns
+            vuln_files = self.get_vulnerable_code_files(ghsa_ids)
+            if vuln_files:
+                print(f"  Including {len(vuln_files)} file(s) with exploitable patterns.")
+                files_content.update(vuln_files)
 
         plan = self.llm.get_remediation_plan(
             ghsa_ids, files_content, self.build_system, build_error

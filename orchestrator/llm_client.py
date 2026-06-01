@@ -30,6 +30,51 @@ class SecurityAgentClient:
         self.client = genai.Client(api_key=api_key)
         self.model_id = "gemini-2.5-flash"
 
+    def get_vulnerable_patterns(self, ghsa_ids: list) -> list:
+        """
+        Given a list of GHSA IDs, return grep patterns for Java code that makes
+        these CVEs actively exploitable (not just having the vulnerable dep).
+        Returns an empty list if no exploitable code patterns exist.
+        """
+        prompt = f"""These security vulnerabilities were found in a Java project:
+{ghsa_ids}
+
+For each vulnerability, what Java source code PATTERNS would make the code actively exploitable
+(e.g. calling a specific API in a dangerous way, not just having the library)?
+
+Return ONLY a JSON array of grep strings to search for in .java files.
+Examples:
+- SnakeYAML deserialization: ["new Yaml()"]
+- Jackson default typing: ["enableDefaultTyping"]
+- XStream unsafe: ["XStream()"]
+- Log4j JNDI lookup context: ["MDC.put", "ThreadContext.put"]
+
+If these CVEs are pure library-internal issues with no dangerous call site pattern,
+return an empty array: []
+
+Return ONLY the JSON array of strings, nothing else."""
+
+        try:
+            response = self.client.models.generate_content(
+                model=self.model_id,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction="Return ONLY a raw JSON array. No markdown, no explanation.",
+                    temperature=0.0
+                )
+            )
+            text = response.text.strip()
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0]
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0]
+            result = json.loads(text.strip())
+            if isinstance(result, list):
+                return [p for p in result if isinstance(p, str)]
+        except Exception as e:
+            print(f"  Pattern detection error: {e}")
+        return []
+
     def get_remediation_plan(self, ghsa_ids, files_content, build_system="maven", build_error=None):
         """
         files_content: dict of {filename: content}
