@@ -2,5 +2,11 @@ temp_repos/
 .venv/
 venv/
 __pycache__/
+*.pyc
 .env
 target/
+.DS_Store
+.claude/
+*.egg-info/
+dist/
+.pytest_cache/

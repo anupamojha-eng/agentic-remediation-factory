@@ -3,16 +3,30 @@ requires = ["setuptools>=82.0.0", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agentic-remediation-factory"
+name = "sentinel-remediation"
 version = "0.1.0"
-description = "Autonomous CVE remediation engine for Java applications"
+description = "Autonomous CVE remediation — patches build files and source code, verifies the build, opens a PR"
+readme = "README.md"
+license = {file = "LICENSE"}
 requires-python = ">=3.11"
+keywords = ["security", "cve", "remediation", "devops", "devsecops", "supply-chain"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Security",
+    "Topic :: Software Development :: Build Tools",
+]
 dependencies = [
-    "docker>=7.1.0",        # To manage the sandbox
-    "GitPython>=3.1.43",    # For repo operations
-    "pydantic>=2.10.0",     # For structured agent data
-    "python-dotenv>=1.0.1"  # For secret management
+    "docker>=7.1.0",
+    "PyGithub>=2.1.1",
+    "google-genai>=1.0.0",
+    "fastapi>=0.111.0",
+    "uvicorn>=0.29.0",
+    "python-dotenv>=1.0.1",
+    "requests>=2.31.0",
 ]
 
-[project.scripts]
-remediate = "orchestrator.main:main"
+[project.urls]
+Homepage = "https://github.com/anupamojha-eng/agentic-remediation-factory"
+Issues = "https://github.com/anupamojha-eng/agentic-remediation-factory/issues"

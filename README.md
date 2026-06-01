@@ -1,132 +1,198 @@
-# Sentinel: Agentic Security Remediation
+# Sentinel — Autonomous CVE Remediation
 
-**Sentinel** is an autonomous platform engineer designed to handle the "last mile" of security compliance: the automated remediation of library vulnerabilities including **transitive dependencies** and **vulnerable code patterns**. It identifies CVEs, patches build files, fixes Java source code where required, verifies the build inside an isolated sandbox, and opens a verified Pull Request — with no human intervention.
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
+[![Ecosystems](https://img.shields.io/badge/ecosystems-Java%20%7C%20Python-green.svg)](#supported-ecosystems)
+
+**Sentinel closes the "last mile" of CVE remediation.**  
+Most tools tell you what's vulnerable. Sentinel fixes it — opening a verified, build-passing pull request with no human in the loop.
+
+```
+CVE detected → fork repo → resolve full dep tree → query OSV →
+patch build files + source code → verify build in sandbox → open PR
+```
+
+**Live demo PRs opened by Sentinel:**
+- Java: [monitorjbl/excel-streaming-reader#271](https://github.com/monitorjbl/excel-streaming-reader/pull/271) — Log4Shell + Apache POI CVEs, `pom.xml` + Java source patched
+- Python: [vulnerable-data-pipeline](https://github.com/anupamojha-eng/vulnerable-data-pipeline) — 5 PyPI CVEs, `requirements.txt` + `config.py` + `cache.py` patched
 
 ---
 
-## What Sentinel Does
+## Why this is different
 
-### Three-layer fix strategy
+| Tool | Detects | Patches build file | Patches source code | Verifies build | Opens PR |
+|---|---|---|---|---|---|
+| Dependabot | ✅ | ✅ | ❌ | ❌ | ✅ |
+| Snyk | ✅ | Partial | ❌ | ❌ | ✅ |
+| Renovate | ✅ | ✅ | ❌ | ❌ | ✅ |
+| **Sentinel** | ✅ | ✅ | ✅ | ✅ | ✅ |
 
-| Layer | Description |
-| :--- | :--- |
-| **Transitive dependency detection** | Resolves the complete dependency tree (`mvn dependency:list` / `gradle dependencies`) and queries the OSV REST API for ALL vulnerabilities — not just declared deps. Catches CVEs that arrive silently through framework transitive dependencies (e.g. snakeyaml via Spring Boot). |
-| **Build file patching** | LLM-driven: upgrades `pom.xml`, `build.gradle`, `build.gradle.kts`, and `gradle/libs.versions.toml` to the minimum safe version. Handles direct versions, version variables, Kotlin DSL, BOM imports, and version catalogs. |
-| **Java source code patching** | When the LLM identifies an exploitable code pattern (e.g. `new Yaml()` for CVE-2022-1471, `enableDefaultTyping` for Jackson CVEs), it greps the source tree and patches the vulnerable call sites alongside the build file. Also fixes compile-time breaks caused by API changes in upgraded libraries. |
-
-### End-to-end verified flow
-
-```
-POST /remediate { repo_url, target_tag }
-  ↓
-Fork upstream repo on GitHub
-  ↓
-Launch isolated Docker sandbox (JDK 17, Maven 3.9, Gradle 9.4, OSV-Scanner)
-  ↓
-Clone fork → resolve full dep tree → OSV API → find all CVEs (direct + transitive)
-  ↓
-LLM scans source tree for exploitable patterns → includes matching .java files
-  ↓
-Gemini 2.5 Flash patches: build file + any vulnerable Java call sites
-  ↓
-mvn clean compile / ./gradlew compileJava (build verified in sandbox)
-  ↓
-If compile fails: LLM reads failing .java files → fixes API incompatibilities → retry
-  ↓
-Push branch → open Pull Request against upstream
-  ↓
-Destroy sandbox container
-```
+Dependabot bumps versions. Sentinel bumps versions *and* fixes the dangerous call sites in your code (`yaml.load()` → `yaml.safe_load()`, `enableDefaultTyping` removal, etc.) — then proves the build still passes before touching your repo.
 
 ---
 
-## Prerequisites & Environment Setup
+## What Sentinel does
 
-| Variable | Description |
-| :--- | :--- |
-| `GITHUB_TOKEN` | Personal Access Token with `repo` scope — forks repos and opens PRs. |
-| `GEMINI_API_KEY` | API key for Gemini 2.5 Flash — reasoning, plan generation, code patching. |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | (Optional) OpenTelemetry collector endpoint for metrics. |
+### Three-layer remediation
+
+**Layer 1 — Transitive CVE detection**  
+Resolves the *complete* dependency tree (not just declared deps) using the native build tool, then queries the OSV REST API for every package including transitively pulled dependencies. Catches CVEs that arrive silently through frameworks — e.g. `snakeyaml` via Spring Boot, `urllib3` via `requests`.
+
+**Layer 2 — Build file patching**  
+LLM upgrades `pom.xml`, `build.gradle`, `build.gradle.kts`, `gradle/libs.versions.toml`, `requirements.txt`, and `pyproject.toml` to the minimum safe version. Handles version variables, BOM imports, Kotlin DSL, and Gradle version catalogs.
+
+**Layer 3 — Source code patching (proactive + reactive)**  
+Greps source files for dangerous call-site patterns tied to the found CVEs:
+
+- **Proactive (Python):** `yaml.load()` → `yaml.safe_load()`, `pickle.loads()` guarded — fires *before* any runtime error, on the first pass
+- **Reactive (Java):** when a library API change breaks compilation (e.g. POI 5.0→5.2 removes a method), Sentinel reads the failing `.java` files and implements the fix, then retries the build
+
+### Verify before merge
+
+Every patch is tested in an isolated Docker sandbox (JDK 17 + Maven/Gradle, Python 3 + pip) before the PR is opened. If the build fails, Sentinel extracts the error, feeds it back to the LLM, and retries up to 3 times. A PR is only opened when `mvn clean compile` / `pip install && pytest` exits 0.
+
+---
+
+## Supported ecosystems
+
+| Build system | Detection | Transitive scan | Source patching | Verify command |
+|---|---|---|---|---|
+| Maven (`pom.xml`) | ✅ | `mvn dependency:list` | ✅ `.java` | `mvn clean compile` |
+| Gradle Groovy | ✅ | `gradle dependencies` | ✅ `.java` | `gradle compileJava` |
+| Gradle KTS | ✅ | `gradle dependencies` | ✅ `.java` | `gradle compileJava` |
+| Gradle version catalog | ✅ | `gradle dependencies` | ✅ `.java` | `gradle compileJava` |
+| `requirements.txt` | ✅ | `pip install` + `pip list` | ✅ `.py` | `pip install && pip check` |
+| `pyproject.toml` | ✅ | `pip install` + `pip list` | ✅ `.py` | `pip install && pytest` |
+
+---
+
+## Quick start
 
 ```bash
-export GITHUB_TOKEN="your_github_token"
-export GEMINI_API_KEY="your_gemini_key"
-```
+# 1. Clone and install
+git clone https://github.com/anupamojha-eng/agentic-remediation-factory
+cd agentic-remediation-factory
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 
----
+# 2. Set credentials
+cp .env.example .env
+# Edit .env — add GITHUB_TOKEN and GEMINI_API_KEY
 
-## Usage
+# 3. Build the sandbox image (one-time, ~5 min)
+docker build -t cve-fixer-sandbox:latest sandbox/
 
-```bash
-# Start the FastAPI service
-python3 orchestrator/driver.py
+# 4. Run against any public repo
+python3 orchestrator/driver.py  # starts the FastAPI service
 
-# Trigger remediation
 curl -X POST http://localhost:8080/remediate \
   -H "Content-Type: application/json" \
-  -d '{"repo_url": "https://github.com/owner/repo", "target_tag": "main"}'
+  -d '{"repo_url": "https://github.com/anupamojha-eng/vulnerable-data-pipeline",
+       "target_tag": "main"}'
+```
+
+Sentinel forks the repo, opens a sandbox container, scans, patches, verifies, and opens a PR — typically in under 3 minutes.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    orchestrator/                         │
+│                                                         │
+│  driver.py        FastAPI service — HTTP entry point    │
+│  factory.py       RemediationFactory                    │
+│    ├─ _detect_build_system()   Maven/Gradle/Python      │
+│    ├─ _scan_internal()         resolve deps → OSV API   │
+│    │    └─ _scan_with_osv_scanner()  fallback           │
+│    ├─ _get_verify_command()    build tool selector      │
+│    └─ retry loop (MAX=3)       smart error routing      │
+│                                                         │
+│  remediator.py    RemediationActor                      │
+│    ├─ get_vulnerable_code_files()  grep → source files  │
+│    ├─ get_affected_java_files()    parse compile errors  │
+│    ├─ autonomous_patch()           LLM → write → verify │
+│    └─ create_pull_request()        branch → push → PR   │
+│                                                         │
+│  llm_client.py    SecurityAgentClient (Gemini 2.5 Flash)│
+│    ├─ get_vulnerable_patterns()    CVE → grep strings   │
+│    └─ get_remediation_plan()       full patch plan      │
+└─────────────────────────────────────────────────────────┘
+                           │
+                           │ Docker SDK
+                           ▼
+┌─────────────────────────────────────────────────────────┐
+│               sandbox/  (Docker image)                   │
+│                                                         │
+│  JDK 17 · Maven 3.9 · Gradle 9.4 · OSV-Scanner         │
+│  Python 3 · pip3 · git                                  │
+│                                                         │
+│  Isolated per-run: no shared state between remediations │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Proven Capabilities
+## Running tests
 
-### Task 1 — Maven & Gradle support
-All five real-world build patterns verified with real Gemini API calls:
-- Maven `<dependency>` version tags and `<properties>` version variables
-- Gradle Groovy DSL direct versions and `ext {}` version variables
-- Gradle Kotlin DSL
-- Gradle version catalogs (`gradle/libs.versions.toml`)
+```bash
+# Fast unit tests (no Docker, no API keys)
+pytest tests/test_python_support.py tests/test_patching.py \
+       tests/test_build_detection.py tests/test_scanner.py -v
 
-### Task 2 — Java source code changes
-When upgrading a library changes its API, Sentinel reads the failing Java files and implements the required fixes:
-- Missing abstract method stubs (e.g. new interface methods added in POI 5.2.x)
-- Type cast corrections (e.g. `SharedStrings` interface change)
-- Missing imports
+# Docker e2e — Java (needs Docker + GEMINI_API_KEY)
+pytest tests/test_e2e_docker.py -v -s
 
-### Transitive CVE detection + exploitable code patching
-The full demo scenario:
-- Spring Boot 2.5.6 pulls in `snakeyaml:1.28` transitively (not declared in `pom.xml`)
-- `ConfigLoader.java` calls `new Yaml().load(untrustedInput)` — the exploitable pattern for CVE-2022-1471
-- Sentinel: detects snakeyaml via full dep tree scan → finds ConfigLoader.java via pattern search → patches both pom.xml (version override) and the Java code (adds `SafeConstructor`)
-- Demo repo: `https://github.com/anupamojha-eng/sentinel-transitive-cve-demo`
+# Docker e2e — Python (needs Docker + GEMINI_API_KEY)
+pytest tests/test_e2e_python_docker.py -v -s
 
-### Retry loop with error feedback
-If the first upgrade attempt breaks the build, Sentinel extracts the compile errors, feeds them back to the LLM, and retries up to 3 times. Java-only compile errors preserve the already-upgraded build file; parse errors restore it.
+# Source patching — Java multi-file (needs Docker + GEMINI_API_KEY)
+pytest tests/test_java_source_patching_e2e.py -v -s
 
----
+# Source patching — Python multi-file (needs Docker + GEMINI_API_KEY)
+pytest tests/test_python_source_patching_e2e.py -v -s
 
-## Observability
-
-Native OpenTelemetry integration:
-- **LLM latency** histogram per model
-- **Token usage** counters (prompt / completion)
-- **Build success rate** visible from retry counts in logs
+# Full pipeline — real GitHub repo (needs Docker + GEMINI_API_KEY + GITHUB_TOKEN)
+pytest tests/test_real_repo_e2e.py -v -s          # Java
+pytest tests/test_real_python_repo_e2e.py -v -s   # Python
+```
 
 ---
 
-## Technical Stack
+## Demo repository
 
-- **Orchestrator**: Python / FastAPI — manages container lifecycle, retry loop, GitHub API
-- **Sandbox**: Docker (JDK 17, Maven 3.9.15, Gradle 9.4.1, OSV-Scanner)
-- **Scanning**: `mvn dependency:list` / `gradle dependencies` + OSV REST API (transitive); OSV-Scanner (fallback)
-- **Reasoning**: Gemini 2.5 Flash (build file patching, code pattern detection, Java source fixes)
-- **Version control**: PyGithub — fork, branch, commit, PR
+[`vulnerable-data-pipeline`](demo_repos/vulnerable-data-pipeline/) — a realistic Flask data-ingestion service with 5 known CVEs and dangerous source patterns in 2 files. Push it to GitHub to use as your own Sentinel test target.
+
+| File | Issue |
+|---|---|
+| `requirements.txt` | PyYAML 5.3.1, cryptography 3.3.2, requests 2.27.0, urllib3 1.24.1 |
+| `app/config.py` | `yaml.load()` — 3 call sites (RCE vector) |
+| `app/cache.py` | `pickle.loads()` — 4 call sites (deserialization RCE) |
+
+Sentinel patches all three files in a single PR.
 
 ---
 
-## Known Limitations
+## Roadmap
 
-### Gradle transitive dependency scanning
-Gradle transitive CVE detection has limited support:
+- [ ] Go (`go.mod`) and Rust (`Cargo.toml`) ecosystem support
+- [ ] SBOM input (CycloneDX / SPDX) for repos without a build tool available
+- [ ] GitHub Actions integration — trigger on Dependabot alert webhook
+- [ ] Container image scanning — pair with Chainguard Wolfi or distroless base images
+- [ ] Web dashboard for PR status and audit trail
 
-- **What works**: If the project has a committed `gradle.lockfile`, OSV-Scanner reads it and detects transitive CVEs.
-- **What doesn't work**: Projects without a `gradle.lockfile` — the `gradle dependencies` fallback requires the project to be resolvable (valid Gradle setup, internet access inside sandbox, no missing plugins). It often fails on first run.
-- **Recommended path**: Add the [CycloneDX Gradle plugin](https://github.com/CycloneDX/cyclonedx-gradle-plugin) to your build and generate an SBOM. OSV-Scanner supports `--sbom` directly. This is not yet automated in Sentinel.
-- **Maven** has no such limitation: `mvn dependency:list` reliably resolves the full tree.
+---
 
-### Exploitable pattern detection accuracy
-The pattern search relies on the LLM knowing which code patterns make a CVE exploitable. For well-known CVEs (Log4Shell, Text4Shell, SnakeYAML deserialization) this works well. For obscure CVEs, the LLM may return no patterns and only the build file gets upgraded.
+## Contributing
 
-### Multi-module Maven/Gradle projects
-The scanner and patcher operate on the root build file. Multi-module projects where the vulnerable dependency or exploitable code is in a submodule are not yet handled.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for vulnerability disclosure policy.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).  
+Copyright 2026 Anupam Ojha
