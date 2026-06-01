@@ -30,50 +30,79 @@ class SecurityAgentClient:
         self.client = genai.Client(api_key=api_key)
         self.model_id = "gemini-2.5-flash"
 
+    # Well-known GHSA IDs mapped to the dangerous Java call-site patterns they require.
+    # Checked first (fast + reliable) before falling back to the LLM for unknowns.
+    _KNOWN_PATTERNS: dict = {
+        # jackson-databind polymorphic typing RCE family
+        "GHSA-jjjh-jjxp-wpff": ["enableDefaultTyping"],
+        "GHSA-rgv9-q543-rqg4": ["enableDefaultTyping"],
+        "GHSA-3x8x-79m2-3w2w": ["enableDefaultTyping"],
+        "GHSA-57j2-w4cx-62h2": ["enableDefaultTyping"],
+        # snakeyaml deserialization RCE family
+        "GHSA-668q-qrv7-99fm": ["new Yaml()"],
+        "GHSA-735f-pc8j-v9w8": ["new Yaml()"],
+        # commons-text Text4Shell
+        "GHSA-599f-7c49-w659": ["new StringSubstitutor"],
+        # Log4Shell family
+        "GHSA-jfh8-c2jp-hdp8": ["MDC.put", "ThreadContext.put"],
+        "GHSA-7rjr-3q55-vv33": ["MDC.put", "ThreadContext.put"],
+        # Kafka unsafe deserialization
+        "GHSA-26f8-x96c-9785": ["new KafkaConsumer", "StringDeserializer"],
+        "GHSA-gg5e-p4p8-6hjm": ["Deserializer"],
+    }
+
     def get_vulnerable_patterns(self, ghsa_ids: list) -> list:
         """
-        Given a list of GHSA IDs, return grep patterns for Java code that makes
-        these CVEs actively exploitable (not just having the vulnerable dep).
-        Returns an empty list if no exploitable code patterns exist.
+        Return grep patterns for Java code that makes these CVEs exploitable.
+        Checks the known-pattern map first (fast + reliable), then falls back
+        to the LLM for CVEs not in the map.
         """
-        prompt = f"""These security vulnerabilities were found in a Java project:
-{ghsa_ids}
+        patterns: set = set()
+        unknown = []
 
-For each vulnerability, what Java source code PATTERNS would make the code actively exploitable
-(e.g. calling a specific API in a dangerous way, not just having the library)?
+        for ghsa in ghsa_ids:
+            if ghsa in self._KNOWN_PATTERNS:
+                patterns.update(self._KNOWN_PATTERNS[ghsa])
+            else:
+                unknown.append(ghsa)
 
-Return ONLY a JSON array of grep strings to search for in .java files.
-Examples:
-- SnakeYAML deserialization: ["new Yaml()"]
-- Jackson default typing: ["enableDefaultTyping"]
-- XStream unsafe: ["XStream()"]
-- Log4j JNDI lookup context: ["MDC.put", "ThreadContext.put"]
+        if unknown:
+            prompt = f"""These Java security vulnerabilities were found in a project:
+{unknown}
 
-If these CVEs are pure library-internal issues with no dangerous call site pattern,
-return an empty array: []
+For each one that is exploitable via a specific dangerous Java code pattern,
+give the grep string that identifies that call site in .java source files.
 
-Return ONLY the JSON array of strings, nothing else."""
+Reference examples:
+  Jackson enableDefaultTyping RCE -> grep: enableDefaultTyping
+  SnakeYAML deserialization RCE   -> grep: new Yaml()
+  Commons-text Text4Shell         -> grep: new StringSubstitutor
+  Log4Shell JNDI via MDC          -> grep: MDC.put
+  Kafka unsafe Deserializer       -> grep: Deserializer
 
-        try:
-            response = self.client.models.generate_content(
-                model=self.model_id,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction="Return ONLY a raw JSON array. No markdown, no explanation.",
-                    temperature=0.0
+Return ONLY a JSON array of grep strings. [] if purely library-internal."""
+
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model_id,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction="Return ONLY a raw JSON array of strings. No markdown.",
+                        temperature=0.0
+                    )
                 )
-            )
-            text = response.text.strip()
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0]
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0]
-            result = json.loads(text.strip())
-            if isinstance(result, list):
-                return [p for p in result if isinstance(p, str)]
-        except Exception as e:
-            print(f"  Pattern detection error: {e}")
-        return []
+                text = response.text.strip()
+                if "```json" in text:
+                    text = text.split("```json")[1].split("```")[0]
+                elif "```" in text:
+                    text = text.split("```")[1].split("```")[0]
+                result = json.loads(text.strip())
+                if isinstance(result, list):
+                    patterns.update(p for p in result if isinstance(p, str))
+            except Exception as e:
+                print(f"  Pattern detection error: {e}")
+
+        return list(patterns)
 
     def get_remediation_plan(self, ghsa_ids, files_content, build_system="maven", build_error=None):
         """

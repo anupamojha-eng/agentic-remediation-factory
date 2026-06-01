@@ -73,8 +73,10 @@ class RemediationActor:
         print(f"  Scanning source tree for exploitable patterns: {patterns}")
         files = {}
         for pattern in patterns[:5]:  # cap to avoid overly broad searches
+            # Use list form so Docker exec runs grep directly (no shell needed)
+            # and the pattern is passed safely without shell-escaping issues.
             result = self.container.exec_run(
-                f"grep -rl '{pattern}' src/ --include='*.java' 2>/dev/null",
+                ["grep", "-rl", "--include=*.java", pattern, "src/"],
                 workdir=self.workspace
             )
             if result.exit_code == 0:
