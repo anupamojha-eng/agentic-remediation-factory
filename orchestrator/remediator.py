@@ -166,11 +166,13 @@ class RemediationActor:
         return True
 
     def create_pull_request(self, ghsa_ids):
-        # Keep branch names short: one ID, or first ID + count for multiple
+        from datetime import datetime
+        # Include timestamp so repeated runs don't conflict with existing open PRs
+        ts = datetime.utcnow().strftime("%m%d-%H%M")
         if len(ghsa_ids) == 1:
-            new_branch = f"fix/{ghsa_ids[0]}"
+            new_branch = f"fix/{ghsa_ids[0]}-{ts}"
         else:
-            new_branch = f"fix/{ghsa_ids[0]}-and-{len(ghsa_ids) - 1}-more"
+            new_branch = f"fix/{ghsa_ids[0]}-and-{len(ghsa_ids) - 1}-more-{ts}"
 
         self.container.exec_run("git config --global user.email 'agent@sentinel.ai'", workdir=self.workspace)
         self.container.exec_run("git config --global user.name 'Sentinel Agent'", workdir=self.workspace)
