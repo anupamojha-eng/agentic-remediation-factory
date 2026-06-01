@@ -90,8 +90,16 @@ class RemediationFactory:
 
             for attempt in range(1, MAX_PATCH_ATTEMPTS + 1):
                 if attempt > 1:
-                    print(f"Retry {attempt}/{MAX_PATCH_ATTEMPTS}: restoring build file and re-patching with error context...")
-                    self._restore_build_files(container, workspace, build_system, build_file)
+                    if self._is_java_compile_error(build_error):
+                        # Build file upgrade is fine — only Java sources need more work.
+                        # Keep pom.xml / build.gradle as patched; LLM sees the partially-fixed
+                        # sources and can add what's still missing iteratively.
+                        print(f"Retry {attempt}/{MAX_PATCH_ATTEMPTS}: Java compile errors — keeping build file, re-patching sources...")
+                    else:
+                        # Build file itself is broken (malformed XML, missing property, etc.).
+                        # Restore it so the LLM starts from a clean slate.
+                        print(f"Retry {attempt}/{MAX_PATCH_ATTEMPTS}: build file error — restoring and re-patching...")
+                        self._restore_build_files(container, workspace, build_system, build_file)
 
                 if not actor.autonomous_patch(cves, build_error):
                     print("Patch generation failed.")
@@ -111,6 +119,16 @@ class RemediationFactory:
         finally:
             container.stop()
             container.remove()
+
+    def _is_java_compile_error(self, build_error: str) -> bool:
+        """True when all errors are in Java source files (not in the build file itself)."""
+        import re
+        has_java = bool(re.search(r'\S+\.java:\[?\d+', build_error))
+        has_build_file_parse = any(k in build_error for k in (
+            "Non-parseable POM", "ProjectBuildingException", "Invalid POM",
+            "could not resolve", "dependency resolution"
+        ))
+        return has_java and not has_build_file_parse
 
     def _restore_build_files(self, container, workspace, build_system, build_file):
         """Restore the build file(s) to their original committed state before a retry."""

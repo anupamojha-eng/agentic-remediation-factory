@@ -1,7 +1,11 @@
 import os
+import re
 import base64
 from llm_client import SecurityAgentClient
 from github import Github
+
+# Maximum source file size to include in LLM prompt (bytes)
+MAX_SOURCE_FILE_BYTES = 30_000
 
 
 class RemediationActor:
@@ -30,8 +34,43 @@ class RemediationActor:
 
         return files
 
+    def get_affected_java_files(self, build_error: str) -> dict:
+        """
+        Parse compile errors for absolute Java file paths, read each file from
+        the container, and return {relative_path: content}.
+
+        Included only for files under MAX_SOURCE_FILE_BYTES to keep the LLM
+        prompt tractable.
+        """
+        # Stop at ':' so we don't capture the :[line,col] suffix from Maven errors.
+        abs_paths = re.findall(
+            rf'{re.escape(self.workspace)}(/[^\s:]+\.java)', build_error
+        )
+        files = {}
+        for rel_path in dict.fromkeys(abs_paths):   # deduplicate, preserve order
+            abs_path = self.workspace + rel_path
+            res = self.container.exec_run(f"cat {abs_path}")
+            if res.exit_code != 0:
+                continue
+            content = res.output.decode("utf-8", errors="replace")
+            if len(content.encode()) > MAX_SOURCE_FILE_BYTES:
+                print(f"  Skipping {rel_path} (>{MAX_SOURCE_FILE_BYTES} bytes)")
+                continue
+            files[rel_path.lstrip("/")] = content
+            print(f"  Including source file: {rel_path.lstrip('/')}")
+        return files
+
     def autonomous_patch(self, ghsa_ids, build_error=None):
         files_content = self.get_build_files_content()
+
+        # On a retry pass: include the Java files the compiler complained about
+        # so the LLM can fix API incompatibilities in source code too.
+        if build_error:
+            java_files = self.get_affected_java_files(build_error)
+            if java_files:
+                print(f"  Feeding {len(java_files)} Java source file(s) to LLM for co-patching.")
+                files_content.update(java_files)
+
         plan = self.llm.get_remediation_plan(
             ghsa_ids, files_content, self.build_system, build_error
         )
@@ -46,7 +85,32 @@ class RemediationActor:
         for change in plan.get("changes", []):
             print(f"  -> {change}")
 
+        # Validate patches before writing — catch malformed XML/TOML early
+        for fname, content in patches.items():
+            err = self._validate_patch(fname, content)
+            if err:
+                print(f"  Patch for {fname} is invalid ({err}) — aborting this attempt.")
+                return False
+
         return all(self._write_file(fname, content) for fname, content in patches.items())
+
+    def _validate_patch(self, filename: str, content: str) -> str:
+        """Return an error string if the patch content is structurally invalid, else ''."""
+        if filename.endswith(".xml"):
+            try:
+                import xml.etree.ElementTree as ET
+                ET.fromstring(content)
+            except Exception as e:
+                return f"invalid XML: {e}"
+        elif filename.endswith(".toml"):
+            try:
+                import tomllib  # Python 3.11+
+                tomllib.loads(content)
+            except ImportError:
+                pass  # older Python — skip validation
+            except Exception as e:
+                return f"invalid TOML: {e}"
+        return ""
 
     def _write_file(self, filename, content):
         parent = os.path.dirname(filename)
