@@ -6,7 +6,7 @@ and Gradle Kotlin DSL without touching GitHub.
 
 Requirements:
   - Docker daemon running
-  - GEMINI_API_KEY set
+  - ANTHROPIC_API_KEY (Claude, recommended) or GEMINI_API_KEY (Gemini)
   - Sandbox image built (auto-built if absent, ~5 min first time)
 
 Run: pytest tests/test_e2e_docker.py -v -s
@@ -58,12 +58,18 @@ def sandbox_image(docker_client):
 @pytest.fixture
 def container(docker_client, sandbox_image):
     """Fresh sandbox container for each test."""
+    env = {}
+    for key in ("ANTHROPIC_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_MODEL",
+                "GEMINI_MODEL", "LLM_PROVIDER"):
+        val = os.getenv(key)
+        if val:
+            env[key] = val
     c = docker_client.containers.run(
         image="cve-fixer-sandbox:latest",
         command="/bin/bash",
         detach=True,
         tty=True,
-        environment={"GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", "")},
+        environment=env,
     )
     # Remove the sandbox's own requirements.txt so it doesn't pollute OSV scans
     c.exec_run("rm -f requirements.txt", workdir=WORKSPACE)
@@ -74,8 +80,8 @@ def container(docker_client, sandbox_image):
 
 @pytest.fixture(scope="session")
 def require_gemini_key():
-    if not os.getenv("GEMINI_API_KEY"):
-        pytest.skip("GEMINI_API_KEY not set")
+    if not os.getenv("ANTHROPIC_API_KEY") and not os.getenv("GEMINI_API_KEY"):
+        pytest.skip("Set ANTHROPIC_API_KEY (Claude) or GEMINI_API_KEY (Gemini)")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

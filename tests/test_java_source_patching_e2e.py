@@ -9,7 +9,7 @@ This test uses a CONTROLLED, MINIMAL setup to prove the capability reliably:
 
 The Java compile error is deterministic — we write the source file ourselves.
 
-Requirements: Docker running, GEMINI_API_KEY, GITHUB_TOKEN.
+Requirements: Docker running, ANTHROPIC_API_KEY or GEMINI_API_KEY, GITHUB_TOKEN.
 
 Run: pytest tests/test_java_source_patching_e2e.py -v -s
 """
@@ -81,9 +81,10 @@ JAVA_SHOULD_COMPILE = True
 
 @pytest.fixture(scope="module", autouse=True)
 def require_env():
-    missing = [v for v in ("GEMINI_API_KEY", "GITHUB_TOKEN") if not os.getenv(v)]
-    if missing:
-        pytest.skip(f"Missing env vars: {missing}")
+    if not os.getenv("ANTHROPIC_API_KEY") and not os.getenv("GEMINI_API_KEY"):
+        pytest.skip("Set ANTHROPIC_API_KEY (Claude) or GEMINI_API_KEY (Gemini)")
+    if not os.getenv("GITHUB_TOKEN"):
+        pytest.skip("Missing env var: GITHUB_TOKEN")
     try:
         import docker
         docker.from_env().ping()
@@ -104,7 +105,9 @@ def sandbox_container(docker_client):
         command="/bin/bash",
         detach=True,
         tty=True,
-        environment={"GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", "")},
+        environment={k: v for k in ("ANTHROPIC_API_KEY", "GEMINI_API_KEY",
+                                      "ANTHROPIC_MODEL", "GEMINI_MODEL", "LLM_PROVIDER")
+                     if (v := os.getenv(k))},
     )
     # Set up the workspace
     c.exec_run(f"rm -rf {WORKSPACE}", workdir="/")

@@ -11,14 +11,14 @@ Target: github.com/anupamojha-eng/vulnerable-data-pipeline
   - app/cache.py     → pickle.loads() (4 call sites, replaced/guarded)
 
 Flow: fork → clone → scan (OSV API + file fallback) → patch build + sources
-      (Gemini 2.5 Flash) → verify (pip install + pytest) → open PR
+      (Claude or Gemini) → verify (pip install + pytest) → open PR
 
 This test is MORE complex than the Java real-repo test (test_real_repo_e2e.py):
   5 GHSAs vs 2 │ 3 patched files vs 1 │ source fixes are proactive, not error-driven
 
 Requirements:
   - Docker running
-  - GEMINI_API_KEY set
+  - ANTHROPIC_API_KEY (Claude, recommended) or GEMINI_API_KEY (Gemini)
   - GITHUB_TOKEN set (repo + fork scope)
   - demo repo pushed to GitHub: demo_repos/vulnerable-data-pipeline/
 
@@ -37,9 +37,10 @@ TARGET_BRANCH = "main"
 
 @pytest.fixture(scope="module", autouse=True)
 def require_env():
-    missing = [v for v in ("GEMINI_API_KEY", "GITHUB_TOKEN") if not os.getenv(v)]
-    if missing:
-        pytest.skip(f"Missing env vars: {missing}")
+    if not os.getenv("ANTHROPIC_API_KEY") and not os.getenv("GEMINI_API_KEY"):
+        pytest.skip("Set ANTHROPIC_API_KEY (Claude) or GEMINI_API_KEY (Gemini)")
+    if not os.getenv("GITHUB_TOKEN"):
+        pytest.skip("Missing env var: GITHUB_TOKEN")
     try:
         import docker
         docker.from_env().ping()
@@ -53,7 +54,7 @@ def test_fork_scan_patch_verify_pr():
 
       fork → clone → detect Python (requirements.txt) →
       OSV transitive scan (PyPI ecosystem) finds ≥4 GHSAs →
-      Gemini patches requirements.txt + app/config.py + app/cache.py →
+      LLM patches requirements.txt + app/config.py + app/cache.py →
       pip install + pytest pass in sandbox →
       PR opened on the upstream repo.
 

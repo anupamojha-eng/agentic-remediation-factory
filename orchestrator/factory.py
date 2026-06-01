@@ -43,20 +43,29 @@ class RemediationFactory:
         return image
 
     def execute_ephemeral_fix(self, upstream_url: str, target_tag: str):
+        anthropic_key = os.getenv("ANTHROPIC_API_KEY")
         gemini_key = os.getenv("GEMINI_API_KEY")
-        if not gemini_key:
-            print("Error: GEMINI_API_KEY not set in orchestrator environment.")
+        if not anthropic_key and not gemini_key:
+            print("Error: set ANTHROPIC_API_KEY (Claude) or GEMINI_API_KEY (Gemini).")
             return None
+
+        # Pass whichever keys are present so the container environment mirrors
+        # the host — the LLM client itself (running on host) reads these directly.
+        env = {"GITHUB_TOKEN": self.gh_token}
+        if anthropic_key:
+            env["ANTHROPIC_API_KEY"] = anthropic_key
+        if gemini_key:
+            env["GEMINI_API_KEY"] = gemini_key
+        llm_provider = os.getenv("LLM_PROVIDER")
+        if llm_provider:
+            env["LLM_PROVIDER"] = llm_provider
 
         container = self.client.containers.run(
             image=self.image_tag,
             command="/bin/bash",
             detach=True,
             tty=True,
-            environment={
-                "GITHUB_TOKEN": self.gh_token,
-                "GEMINI_API_KEY": gemini_key
-            }
+            environment=env,
         )
         try:
             auth = Auth.Token(self.gh_token)

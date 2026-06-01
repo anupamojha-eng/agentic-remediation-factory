@@ -11,7 +11,10 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env
-# Add GITHUB_TOKEN and GEMINI_API_KEY to .env
+# Add GITHUB_TOKEN and at least one LLM key:
+#   ANTHROPIC_API_KEY  — Claude Opus 4.8 (recommended, best patch accuracy)
+#   GEMINI_API_KEY     — Gemini 2.5 Flash (cost-effective alternative)
+# Both can coexist; Anthropic is preferred when both are set.
 ```
 
 Build the sandbox image (required for Docker-based tests):
@@ -25,9 +28,9 @@ docker build -t cve-fixer-sandbox:latest sandbox/
 | Tier | Command | Needs |
 |---|---|---|
 | Unit | `pytest tests/test_python_support.py tests/test_patching.py tests/test_build_detection.py` | Nothing |
-| Docker e2e | `pytest tests/test_e2e_docker.py tests/test_e2e_python_docker.py -v -s` | Docker + `GEMINI_API_KEY` |
-| Source patching | `pytest tests/test_java_source_patching_e2e.py tests/test_python_source_patching_e2e.py -v -s` | Docker + `GEMINI_API_KEY` |
-| Real repo | `pytest tests/test_real_repo_e2e.py tests/test_real_python_repo_e2e.py -v -s` | Docker + both keys |
+| Docker e2e | `pytest tests/test_e2e_docker.py tests/test_e2e_python_docker.py -v -s` | Docker + `ANTHROPIC_API_KEY` or `GEMINI_API_KEY` |
+| Source patching | `pytest tests/test_java_source_patching_e2e.py tests/test_python_source_patching_e2e.py -v -s` | Docker + `ANTHROPIC_API_KEY` or `GEMINI_API_KEY` |
+| Real repo | `pytest tests/test_real_repo_e2e.py tests/test_real_python_repo_e2e.py -v -s` | Docker + `ANTHROPIC_API_KEY` or `GEMINI_API_KEY` + `GITHUB_TOKEN` |
 
 Always run the unit tests before submitting a PR. Docker e2e tests are run in CI on merge.
 

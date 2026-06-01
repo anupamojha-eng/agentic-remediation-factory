@@ -20,7 +20,7 @@ Expected outcome after autonomous_patch:
   - app/cache.py: pickle.loads() replaced or guarded with a comment
   - pip3 install --user -r requirements.txt && pip3 check: exit 0
 
-Requirements: Docker running, GEMINI_API_KEY.
+Requirements: Docker running, ANTHROPIC_API_KEY (Claude) or GEMINI_API_KEY (Gemini).
 
 Run: pytest tests/test_python_source_patching_e2e.py -v -s
 """
@@ -118,9 +118,8 @@ class SessionCache:
 
 @pytest.fixture(scope="module", autouse=True)
 def require_env():
-    missing = [v for v in ("GEMINI_API_KEY",) if not os.getenv(v)]
-    if missing:
-        pytest.skip(f"Missing env vars: {missing}")
+    if not os.getenv("ANTHROPIC_API_KEY") and not os.getenv("GEMINI_API_KEY"):
+        pytest.skip("Set ANTHROPIC_API_KEY (Claude) or GEMINI_API_KEY (Gemini)")
     try:
         import docker
         docker.from_env().ping()
@@ -141,7 +140,9 @@ def sandbox_container(docker_client):
         command="/bin/bash",
         detach=True,
         tty=True,
-        environment={"GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", "")},
+        environment={k: v for k in ("ANTHROPIC_API_KEY", "GEMINI_API_KEY",
+                                      "ANTHROPIC_MODEL", "GEMINI_MODEL", "LLM_PROVIDER")
+                     if (v := os.getenv(k))},
     )
     c.exec_run(f"rm -rf {WORKSPACE}", workdir="/")
     c.exec_run(f"mkdir -p {WORKSPACE}/app", workdir="/")

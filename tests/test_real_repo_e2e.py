@@ -5,9 +5,9 @@ Target: monitorjbl/excel-streaming-reader
   - log4j-core 2.14.1 (test scope) → Log4Shell family (GHSA-jfh8-c2jp-hdp8 etc.)
   - apache.poi 5.0.0               → several known CVEs
 
-Flow: fork → clone → scan (OSV-Scanner) → patch (Gemini) → verify (mvn) → PR
+Flow: fork → clone → scan (OSV-Scanner) → patch (Claude or Gemini) → verify (mvn) → PR
 
-Requirements: Docker running, GEMINI_API_KEY, GITHUB_TOKEN
+Requirements: Docker running, ANTHROPIC_API_KEY or GEMINI_API_KEY, GITHUB_TOKEN
 
 Run: pytest tests/test_real_repo_e2e.py -v -s
 """
@@ -24,9 +24,10 @@ TARGET_BRANCH = "master"
 
 @pytest.fixture(scope="module", autouse=True)
 def require_env():
-    missing = [v for v in ("GEMINI_API_KEY", "GITHUB_TOKEN") if not os.getenv(v)]
-    if missing:
-        pytest.skip(f"Missing env vars: {missing}")
+    if not os.getenv("ANTHROPIC_API_KEY") and not os.getenv("GEMINI_API_KEY"):
+        pytest.skip("Set ANTHROPIC_API_KEY (Claude) or GEMINI_API_KEY (Gemini)")
+    if not os.getenv("GITHUB_TOKEN"):
+        pytest.skip("Missing env var: GITHUB_TOKEN")
     try:
         import docker
         docker.from_env().ping()
@@ -38,7 +39,7 @@ def test_fork_scan_patch_verify_pr():
     """
     Drives the full Sentinel pipeline against a real vulnerable repo:
     fork → clone at branch → detect Maven → OSV-Scanner finds CVEs →
-    Gemini patches pom.xml → mvn clean compile passes → PR opened.
+    LLM patches pom.xml → mvn clean compile passes → PR opened.
     """
     from factory import RemediationFactory
 

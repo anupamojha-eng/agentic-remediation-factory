@@ -73,7 +73,12 @@ requirements.txt  ← 7 packages, 5 known CVEs
 ```bash
 # Set up credentials
 export GITHUB_TOKEN=<your PAT with repo + fork scope>
-export GEMINI_API_KEY=<your Gemini API key>
+
+# Use Claude (recommended — best accuracy, prompt caching on retries)
+export ANTHROPIC_API_KEY=<your Anthropic API key>
+
+# Or Gemini (cost-effective alternative)
+# export GEMINI_API_KEY=<your Gemini API key>
 
 # Run
 cd agentic-remediation-factory

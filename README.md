@@ -118,7 +118,9 @@ Sentinel forks the repo, opens a sandbox container, scans, patches, verifies, an
 │    ├─ autonomous_patch()           LLM → write → verify │
 │    └─ create_pull_request()        branch → push → PR   │
 │                                                         │
-│  llm_client.py    SecurityAgentClient (Gemini 2.5 Flash)│
+│  llm_client.py    SecurityAgentClient                   │
+│    ├─ _AnthropicProvider  Claude Opus 4.8 (default)     │
+│    ├─ _GeminiProvider     Gemini 2.5 Flash (alt)        │
 │    ├─ get_vulnerable_patterns()    CVE → grep strings   │
 │    └─ get_remediation_plan()       full patch plan      │
 └─────────────────────────────────────────────────────────┘
@@ -156,7 +158,7 @@ pytest tests/test_java_source_patching_e2e.py -v -s
 # Source patching — Python multi-file (needs Docker + ANTHROPIC_API_KEY or GEMINI_API_KEY)
 pytest tests/test_python_source_patching_e2e.py -v -s
 
-# Full pipeline — real GitHub repo (needs Docker + GEMINI_API_KEY + GITHUB_TOKEN)
+# Full pipeline — real GitHub repo (needs Docker + ANTHROPIC_API_KEY or GEMINI_API_KEY + GITHUB_TOKEN)
 pytest tests/test_real_repo_e2e.py -v -s          # Java
 pytest tests/test_real_python_repo_e2e.py -v -s   # Python
 ```
