@@ -4,6 +4,8 @@ import os
 from github import Github, Auth
 from remediator import RemediationActor
 
+MAX_PATCH_ATTEMPTS = 3
+
 
 class RemediationFactory:
     def __init__(self):
@@ -30,7 +32,7 @@ class RemediationFactory:
         gemini_key = os.getenv("GEMINI_API_KEY")
         if not gemini_key:
             print("Error: GEMINI_API_KEY not set in orchestrator environment.")
-            return
+            return None
 
         container = self.client.containers.run(
             image=self.image_tag,
@@ -52,18 +54,20 @@ class RemediationFactory:
 
             repo = gh.get_repo(repo_path)
             fork = repo.create_fork()
-            print(f"Fork created at {fork.html_url}")
+            # create_fork returns the existing fork if one already exists — that's fine
+            print(f"Fork ready at {fork.html_url}")
 
             auth_url = fork.clone_url.replace("https://", f"https://{self.gh_token}@")
             workspace = "/home/agent/workspace"
 
-            container.exec_run(f"rm -rf {workspace}")
-            container.exec_run(f"mkdir -p {workspace}")
+            # Run setup from / — workspace may not exist yet (WORKDIR deleted by rm -rf)
+            container.exec_run(f"rm -rf {workspace}", workdir="/")
+            container.exec_run(f"mkdir -p {workspace}", workdir="/")
 
-            clone_res = container.exec_run(f"git clone {auth_url} {workspace}")
+            clone_res = container.exec_run(f"git clone {auth_url} {workspace}", workdir="/")
             if clone_res.exit_code != 0:
                 print(f"Git Clone Failed: {clone_res.output.decode()}")
-                return
+                return None
 
             container.exec_run(f"git remote add upstream {upstream_url}", workdir=workspace)
             container.exec_run("git fetch upstream --tags", workdir=workspace)
@@ -72,26 +76,62 @@ class RemediationFactory:
             build_system, build_file = self._detect_build_system(container, workspace)
             if not build_system:
                 print("Error: No supported build file found (pom.xml / build.gradle / build.gradle.kts)")
-                return
+                return None
             print(f"Detected build system: {build_system} ({build_file})")
 
             actor = RemediationActor(container, fork, build_system, build_file)
             cves = self._scan_internal(container, workspace)
             if not cves:
                 print("No vulnerabilities found — nothing to remediate.")
-                return
+                return None
 
-            if actor.autonomous_patch(cves):
-                verify_cmd = self._get_verify_command(build_system, container, workspace)
+            verify_cmd = self._get_verify_command(build_system, container, workspace)
+            build_error = None
+
+            for attempt in range(1, MAX_PATCH_ATTEMPTS + 1):
+                if attempt > 1:
+                    print(f"Retry {attempt}/{MAX_PATCH_ATTEMPTS}: restoring build file and re-patching with error context...")
+                    self._restore_build_files(container, workspace, build_system, build_file)
+
+                if not actor.autonomous_patch(cves, build_error):
+                    print("Patch generation failed.")
+                    return None
+
                 print(f"Verifying build with: {verify_cmd}")
                 verify = container.exec_run(verify_cmd, workdir=workspace)
                 if verify.exit_code == 0:
-                    actor.create_pull_request(cves)
-                else:
-                    print(f"Build verification failed:\n{verify.output.decode()}")
+                    print("Build verified successfully.")
+                    return actor.create_pull_request(cves)
+
+                build_error = self._extract_build_error(verify.output.decode())
+                print(f"Build failed (attempt {attempt}/{MAX_PATCH_ATTEMPTS}):\n{build_error}")
+
+            print(f"Build still failing after {MAX_PATCH_ATTEMPTS} attempts — giving up.")
+            return None
         finally:
             container.stop()
             container.remove()
+
+    def _restore_build_files(self, container, workspace, build_system, build_file):
+        """Restore the build file(s) to their original committed state before a retry."""
+        container.exec_run(f"git checkout HEAD -- {build_file}", workdir=workspace)
+        if build_system == "gradle":
+            # Restore version catalog too if it exists
+            container.exec_run(
+                "git checkout HEAD -- gradle/libs.versions.toml 2>/dev/null || true",
+                workdir=workspace
+            )
+
+    def _extract_build_error(self, raw_output: str) -> str:
+        """Return only the actionable error lines from a build log, not download noise."""
+        keywords = ("[ERROR]", "[FATAL]", "BUILD FAILURE", "COMPILATION ERROR",
+                    "cannot find symbol", "error:", "package does not exist")
+        lines = raw_output.splitlines()
+        error_lines = [l for l in lines if any(k in l for k in keywords)]
+        # Always include the last few lines as they usually contain the summary
+        tail = lines[-20:]
+        combined = error_lines + [l for l in tail if l not in error_lines]
+        return "\n".join(combined[:60])
 
     def _detect_build_system(self, container, workspace):
         if container.exec_run("test -f pom.xml", workdir=workspace).exit_code == 0:

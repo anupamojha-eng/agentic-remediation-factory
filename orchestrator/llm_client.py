@@ -41,7 +41,16 @@ class SecurityAgentClient:
         for filename, content in files_content.items():
             files_section += f"\n### {filename}\n```\n{content}\n```\n"
 
-        error_section = f"\nBuild error to also fix:\n{build_error}" if build_error else ""
+        if build_error:
+            error_section = (
+                f"\nPREVIOUS PATCH ATTEMPT FAILED. The build broke with this error:\n"
+                f"```\n{build_error}\n```\n"
+                f"You MUST produce a more conservative patch. Prefer the smallest safe version "
+                f"upgrade that fixes each vulnerability. Do NOT upgrade dependencies whose new "
+                f"version introduces API incompatibilities visible in the error above."
+            )
+        else:
+            error_section = ""
 
         user_prompt = f"""Fix the following security vulnerabilities in the provided build file(s).
 
@@ -67,6 +76,7 @@ Rules:
 - For build.gradle.kts: same as above but Kotlin DSL syntax (double-quoted strings, val declarations)
 - For gradle/libs.versions.toml: update version values in the [versions] table
 - Only change what is necessary to fix the specified vulnerabilities
+- Prefer the minimum version that fixes the vulnerability — avoid unnecessary major upgrades
 - Preserve all formatting, whitespace, comments, and file structure exactly
 """
 
