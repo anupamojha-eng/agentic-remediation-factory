@@ -1,0 +1,9 @@
+# Intentionally vulnerable versions — used by e2e Docker tests
+# GHSA-8q59-q68h-6hv4: PyYAML < 6.0, arbitrary code execution via yaml.load()
+PyYAML==5.3.1
+# GHSA-j8r2-6x86-q33q: requests < 2.31.0, credentials leaked on redirect
+requests==2.27.0
+# GHSA-q2q7-5pp4-w6pg: urllib3 < 1.26.5, header injection via CRLF
+urllib3==1.24.1
+# GHSA-v8gr-m533-ghj9: cryptography < 39.0.1, RSA decryption oracle (Bleichenbacher)
+cryptography==3.3.2
