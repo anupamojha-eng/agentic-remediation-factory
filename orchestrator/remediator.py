@@ -182,7 +182,8 @@ class RemediationActor:
             print(f"Push failed: {push.output.decode()}")
             return None
 
-        parent_repo = self.fork.parent
+        # If we forked our own repo, fork.parent is None — use the repo itself
+        parent_repo = self.fork.parent if self.fork.parent else self.fork
         ghsa_list = ", ".join(ghsa_ids)
         body = (
             f"## Automated Security Remediation\n\n"
