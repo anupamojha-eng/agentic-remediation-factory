@@ -1,21 +1,157 @@
+"""
+LLM provider abstraction for Sentinel.
+
+Supports Anthropic (Claude) and Google (Gemini). Provider is auto-detected
+from environment variables or forced via LLM_PROVIDER=anthropic|gemini.
+
+Priority: ANTHROPIC_API_KEY > GEMINI_API_KEY (Claude is preferred for complex
+multi-file code reasoning; Gemini Flash is a cost-effective alternative).
+
+Prompt caching (Anthropic only): on retry calls the expensive `rules + file
+contents` block is served from cache; only the new build error is billed at
+full price. This saves ~80-90% of input tokens on the second and third attempts.
+"""
 import os
 import json
 import re as _re
-from google import genai
-from google.genai import types
 import time
+
 from opentelemetry import metrics
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import ConsoleMetricExporter, PeriodicExportingMetricReader
 
 reader = PeriodicExportingMetricReader(ConsoleMetricExporter())
-provider = MeterProvider(metric_readers=[reader])
-metrics.set_meter_provider(provider)
+metrics.set_meter_provider(MeterProvider(metric_readers=[reader]))
 meter = metrics.get_meter("remediation.agent")
-
 latency_hist = meter.create_histogram("llm_latency", unit="ms")
 token_counter = meter.create_counter("llm_tokens_total")
 
+
+# ── Provider abstraction ───────────────────────────────────────────────────────
+
+class _LLMProvider:
+    model_id: str = ""
+
+    def generate(self, system: str, user: str) -> str:
+        """Single-block generate — no caching."""
+        raise NotImplementedError
+
+    def generate_cached(self, system: str, cacheable_user: str, volatile_user: str = "") -> str:
+        """
+        Two-block generate: `cacheable_user` is marked for caching (stable across
+        retries); `volatile_user` is appended uncached (changes per retry).
+
+        Falls back to simple generate if the provider doesn't support caching.
+        """
+        combined = cacheable_user + ("\n\n" + volatile_user if volatile_user else "")
+        return self.generate(system, combined)
+
+    def record_tokens(self, prompt_tokens: int, completion_tokens: int):
+        token_counter.add(prompt_tokens, {"type": "prompt", "model": self.model_id})
+        token_counter.add(completion_tokens, {"type": "completion", "model": self.model_id})
+
+
+class _GeminiProvider(_LLMProvider):
+    def __init__(self):
+        from google import genai
+        from google.genai import types as _types
+        self._types = _types
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY not set")
+        self._client = genai.Client(api_key=api_key)
+        self.model_id = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        print(f"  [LLM] Gemini provider: {self.model_id}")
+
+    def generate(self, system: str, user: str) -> str:
+        resp = self._client.models.generate_content(
+            model=self.model_id,
+            contents=user,
+            config=self._types.GenerateContentConfig(
+                system_instruction=system,
+                temperature=0.1,
+            ),
+        )
+        usage = resp.usage_metadata
+        self.record_tokens(
+            usage.prompt_token_count or 0,
+            usage.candidates_token_count or 0,
+        )
+        return resp.text
+
+
+class _AnthropicProvider(_LLMProvider):
+    def __init__(self):
+        import anthropic as _sdk
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError("ANTHROPIC_API_KEY not set")
+        self._client = _sdk.Anthropic(api_key=api_key)
+        self.model_id = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
+        print(f"  [LLM] Anthropic provider: {self.model_id}")
+
+    def generate(self, system: str, user: str) -> str:
+        resp = self._client.messages.create(
+            model=self.model_id,
+            max_tokens=8192,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        self.record_tokens(resp.usage.input_tokens, resp.usage.output_tokens)
+        return resp.content[0].text
+
+    def generate_cached(self, system: str, cacheable_user: str, volatile_user: str = "") -> str:
+        """
+        Marks `cacheable_user` with cache_control so it's cached across retries.
+        When Sentinel retries a failed patch, `cacheable_user` (rules + file
+        contents) is served from cache; only `volatile_user` (the new build
+        error) is billed at full price.
+
+        Cache fires when the block exceeds the model's minimum (~4096 tokens for
+        Opus, ~2048 for Sonnet). File contents typically push us well past that.
+        """
+        content = [
+            {
+                "type": "text",
+                "text": cacheable_user,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+        if volatile_user:
+            content.append({"type": "text", "text": volatile_user})
+
+        resp = self._client.messages.create(
+            model=self.model_id,
+            max_tokens=8192,
+            system=system,
+            messages=[{"role": "user", "content": content}],
+        )
+        u = resp.usage
+        self.record_tokens(u.input_tokens, u.output_tokens)
+        cache_read = getattr(u, "cache_read_input_tokens", 0) or 0
+        cache_write = getattr(u, "cache_creation_input_tokens", 0) or 0
+        if cache_read or cache_write:
+            print(f"  [cache] read={cache_read} write={cache_write} uncached={u.input_tokens}")
+        return resp.content[0].text
+
+
+def _make_provider() -> _LLMProvider:
+    """Select provider from env vars. Anthropic wins when both keys are set."""
+    forced = os.getenv("LLM_PROVIDER", "").lower()
+    has_anthropic = bool(os.getenv("ANTHROPIC_API_KEY"))
+    has_gemini = bool(os.getenv("GEMINI_API_KEY"))
+
+    if forced == "anthropic" or (not forced and has_anthropic):
+        return _AnthropicProvider()
+    if forced == "gemini" or (not forced and has_gemini):
+        return _GeminiProvider()
+    raise ValueError(
+        "No LLM API key found. Set ANTHROPIC_API_KEY (Claude) or GEMINI_API_KEY (Gemini). "
+        "Optionally set LLM_PROVIDER=anthropic|gemini to force a provider when both are set."
+    )
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _is_java_compile_error(build_error: str) -> bool:
     return bool(_re.search(r'\S+\.java:\[?\d+', build_error or ""))
@@ -25,15 +161,18 @@ def _is_python_error(build_error: str) -> bool:
     return bool(_re.search(r'File ".*\.py"', build_error or ""))
 
 
+def _strip_json_fences(text: str) -> str:
+    text = text.strip()
+    if "```json" in text:
+        text = text.split("```json")[1].split("```")[0]
+    elif "```" in text:
+        text = text.split("```")[1].split("```")[0]
+    return text.strip()
+
+
+# ── Main client ────────────────────────────────────────────────────────────────
+
 class SecurityAgentClient:
-    def __init__(self):
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY not found in environment.")
-
-        self.client = genai.Client(api_key=api_key)
-        self.model_id = "gemini-2.5-flash"
-
     # Well-known GHSA IDs → dangerous call-site grep patterns (Java and Python).
     # Checked first (fast + reliable) before falling back to the LLM for unknowns.
     _KNOWN_PATTERNS: dict = {
@@ -64,25 +203,24 @@ class SecurityAgentClient:
         "GHSA-h5c8-rqwp-cp95": ["render_template_string("],
     }
 
-    # Python-specific dangerous patterns always checked regardless of GHSA IDs.
-    # These cover the most common exploitable patterns in Python projects.
     _PYTHON_ALWAYS_CHECK: list = [
         "yaml.load(",
         "pickle.loads(",
         "pickle.load(",
     ]
 
+    def __init__(self):
+        self.llm = _make_provider()
+        self.model_id = self.llm.model_id  # kept for OTel label compatibility
+
     def get_vulnerable_patterns(self, ghsa_ids: list, build_system: str = "maven") -> list:
         """
         Return grep patterns for source files that make these CVEs exploitable.
-        Checks the known-pattern map first (fast + reliable), then falls back
-        to the LLM for CVEs not in the map.
-        For Python projects, always includes the core dangerous patterns.
+        Checks the known-pattern map first, then falls back to the LLM.
         """
         patterns: set = set()
         unknown = []
 
-        # Always include core Python patterns for Python projects
         if build_system == "python":
             patterns.update(self._PYTHON_ALWAYS_CHECK)
 
@@ -98,7 +236,7 @@ class SecurityAgentClient:
             prompt = f"""These {lang} security vulnerabilities were found in a project:
 {unknown}
 
-For each one that is exploitable via a specific dangerous {lang} code pattern,
+For each one exploitable via a specific dangerous {lang} code pattern,
 give the grep string that identifies that call site in {ext} source files.
 
 Reference examples ({lang}):
@@ -109,20 +247,11 @@ Reference examples ({lang}):
 Return ONLY a JSON array of grep strings. [] if purely library-internal."""
 
             try:
-                response = self.client.models.generate_content(
-                    model=self.model_id,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction="Return ONLY a raw JSON array of strings. No markdown.",
-                        temperature=0.0
-                    )
+                text = self.llm.generate(
+                    system="Return ONLY a raw JSON array of strings. No markdown.",
+                    user=prompt,
                 )
-                text = response.text.strip()
-                if "```json" in text:
-                    text = text.split("```json")[1].split("```")[0]
-                elif "```" in text:
-                    text = text.split("```")[1].split("```")[0]
-                result = json.loads(text.strip())
+                result = json.loads(_strip_json_fences(text))
                 if isinstance(result, list):
                     patterns.update(p for p in result if isinstance(p, str))
             except Exception as e:
@@ -141,64 +270,52 @@ Return ONLY a JSON array of grep strings. [] if purely library-internal."""
             f"\n### {fn}\n```\n{content}\n```" for fn, content in files_content.items()
         )
 
-        if build_error and _is_java_compile_error(build_error):
-            user_prompt = self._compile_fix_prompt(ghsa_ids, build_system, build_error, files_section)
-            system_instructions = (
+        is_compile_error = build_error and _is_java_compile_error(build_error)
+
+        if is_compile_error:
+            system = (
                 "You are a Java engineer fixing compilation errors. "
                 "Return ONLY a raw JSON object — no preamble, no markdown fences. "
-                "You MUST return a 'patches' entry for every .java file that appears in the errors."
+                "You MUST return a 'patches' entry for every .java file in the errors."
+            )
+            cacheable, volatile = self._compile_fix_prompt(
+                ghsa_ids, build_system, build_error, files_section
             )
         else:
-            user_prompt = self._cve_fix_prompt(ghsa_ids, build_system, build_error, files_section)
-            system_instructions = (
-                "You are a Senior Security Engineer. Return ONLY a raw JSON object. "
-                "Do not include any preamble, explanation, or markdown code blocks."
+            system = (
+                "You are a Senior Security Engineer. "
+                "Return ONLY a raw JSON object. "
+                "No preamble, explanation, or markdown code blocks."
+            )
+            cacheable, volatile = self._cve_fix_prompt(
+                ghsa_ids, build_system, build_error, files_section
             )
 
         try:
-            response = self.client.models.generate_content(
-                model=self.model_id,
-                contents=user_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instructions,
-                    temperature=0.1
-                )
-            )
-
-            text = response.text.strip()
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0]
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0]
-
-            duration = (time.time() - start) * 1000
-            latency_hist.record(duration, {"model": self.model_id})
-
-            usage = response.usage_metadata
-            token_counter.add(usage.prompt_token_count, {"type": "prompt"})
-            token_counter.add(usage.candidates_token_count, {"type": "completion"})
-
-            return json.loads(text.strip())
+            text = self.llm.generate_cached(system, cacheable, volatile)
+            duration_ms = (time.time() - start) * 1000
+            latency_hist.record(duration_ms, {"model": self.model_id})
+            return json.loads(_strip_json_fences(text))
         except Exception as e:
             print(f"LLM Inference Error: {e}")
             return None
 
-    def _cve_fix_prompt(self, ghsa_ids, build_system, build_error, files_section):
-        error_section = ""
-        if build_error:
-            error_section = (
-                f"\nPREVIOUS PATCH ATTEMPT FAILED. The build broke with this error:\n"
-                f"```\n{build_error}\n```\n"
-                f"You MUST produce a more conservative patch. Prefer the smallest safe version "
-                f"upgrade that fixes each vulnerability. Do NOT upgrade dependencies whose new "
-                f"version introduces API incompatibilities visible in the error above."
-            )
+    # ── Prompt builders (return cacheable_block, volatile_block) ──────────────
 
-        return f"""Fix the following security vulnerabilities in the provided build file(s).
+    def _cve_fix_prompt(
+        self, ghsa_ids, build_system, build_error, files_section
+    ) -> tuple[str, str]:
+        """
+        Returns (cacheable, volatile).
+
+        cacheable = rules + file contents  → stable across retry attempts
+        volatile  = error section          → changes each retry
+        """
+        cacheable = f"""Fix the following security vulnerabilities in the provided build/source file(s).
 
 GHSAs to fix: {ghsa_ids}
 Build system: {build_system}
-{error_section}
+
 Files to analyze and patch:
 {files_section}
 
@@ -229,20 +346,34 @@ Rules:
     - Replace subprocess calls with shell=True with list-form when input may be user-controlled
 - For *.java source files: implement missing abstract methods (minimal stub throwing
   UnsupportedOperationException for read-only adapters), fix incompatible type casts,
-  and update deprecated/removed API calls. Return the COMPLETE file content.
-"""
+  and update deprecated/removed API calls. Return the COMPLETE file content."""
 
-    def _compile_fix_prompt(self, ghsa_ids, build_system, build_error, files_section):
-        return f"""This {build_system} project has TWO problems you must fix in one pass:
+        volatile = ""
+        if build_error:
+            volatile = (
+                f"\nPREVIOUS PATCH ATTEMPT FAILED. The build broke with this error:\n"
+                f"```\n{build_error}\n```\n"
+                f"Produce a more conservative patch. Prefer the smallest safe version upgrade "
+                f"that fixes each vulnerability. Do NOT upgrade dependencies whose new version "
+                f"introduces API incompatibilities visible in the error above."
+            )
+
+        return cacheable, volatile
+
+    def _compile_fix_prompt(
+        self, ghsa_ids, build_system, build_error, files_section
+    ) -> tuple[str, str]:
+        """
+        Returns (cacheable, volatile).
+
+        cacheable = task description + file contents (stable across retries)
+        volatile  = the compilation errors (changes as source files are fixed)
+        """
+        cacheable = f"""This {build_system} project has TWO problems you must fix in one pass:
 1. Security vulnerabilities: {ghsa_ids} — fix by upgrading the vulnerable dependencies in the build file.
 2. Compilation errors that prevent the project from building.
 
 You must return patches for BOTH the build file (dependency upgrades) AND every failing Java source file.
-
-COMPILATION ERRORS:
-```
-{build_error}
-```
 
 Current file contents (some already partially patched):
 {files_section}
@@ -261,9 +392,7 @@ Rules — apply ALL of these to fix every error listed above:
 2. For every error "does not override abstract method M(T1, T2, ...)":
    - The error message shows the EXACT signature you must implement.
    - Add that EXACT method with that EXACT parameter list to the class body.
-   - CRITICAL: copy the parameter types verbatim from the error message — if the error
-     says (int,int,int,int,int) use five ints, NOT PaneType; if it says (PageMargin)
-     use PageMargin, NOT short or int.
+   - CRITICAL: copy the parameter types verbatim from the error message.
    - Body: throw new UnsupportedOperationException("Not supported by streaming reader");
    - Add any necessary imports for the parameter types.
 3. For every error "incompatible types: A cannot be converted to B":
@@ -271,5 +400,8 @@ Rules — apply ALL of these to fix every error listed above:
 4. For every error "cannot find symbol: class X":
    - Add the correct import statement for X.
 5. For each .java file with errors: fix ALL its errors in one pass.
-6. You MUST include a "patches" entry for every .java file in the errors above.
-"""
+6. You MUST include a "patches" entry for every .java file in the errors above."""
+
+        volatile = f"\nCOMPILATION ERRORS:\n```\n{build_error}\n```"
+
+        return cacheable, volatile

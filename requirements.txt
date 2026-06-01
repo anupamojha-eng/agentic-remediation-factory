@@ -4,6 +4,7 @@ pydantic
 docker
 PyGithub
 google-genai
+anthropic>=0.40.0
 python-dotenv
 opentelemetry-api
 opentelemetry-sdk

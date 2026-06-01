@@ -77,7 +77,10 @@ pip install -r requirements.txt
 
 # 2. Set credentials
 cp .env.example .env
-# Edit .env — add GITHUB_TOKEN and GEMINI_API_KEY
+# Edit .env — add GITHUB_TOKEN and at least one LLM key:
+#   ANTHROPIC_API_KEY  (Claude — recommended, best accuracy)
+#   GEMINI_API_KEY     (Gemini Flash — cost-effective alternative)
+# Both keys can coexist; Anthropic is preferred when both are set.
 
 # 3. Build the sandbox image (one-time, ~5 min)
 docker build -t cve-fixer-sandbox:latest sandbox/
@@ -141,16 +144,16 @@ Sentinel forks the repo, opens a sandbox container, scans, patches, verifies, an
 pytest tests/test_python_support.py tests/test_patching.py \
        tests/test_build_detection.py tests/test_scanner.py -v
 
-# Docker e2e — Java (needs Docker + GEMINI_API_KEY)
+# Docker e2e — Java (needs Docker + ANTHROPIC_API_KEY or GEMINI_API_KEY)
 pytest tests/test_e2e_docker.py -v -s
 
-# Docker e2e — Python (needs Docker + GEMINI_API_KEY)
+# Docker e2e — Python (needs Docker + ANTHROPIC_API_KEY or GEMINI_API_KEY)
 pytest tests/test_e2e_python_docker.py -v -s
 
-# Source patching — Java multi-file (needs Docker + GEMINI_API_KEY)
+# Source patching — Java multi-file (needs Docker + ANTHROPIC_API_KEY or GEMINI_API_KEY)
 pytest tests/test_java_source_patching_e2e.py -v -s
 
-# Source patching — Python multi-file (needs Docker + GEMINI_API_KEY)
+# Source patching — Python multi-file (needs Docker + ANTHROPIC_API_KEY or GEMINI_API_KEY)
 pytest tests/test_python_source_patching_e2e.py -v -s
 
 # Full pipeline — real GitHub repo (needs Docker + GEMINI_API_KEY + GITHUB_TOKEN)
@@ -171,6 +174,29 @@ pytest tests/test_real_python_repo_e2e.py -v -s   # Python
 | `app/cache.py` | `pickle.loads()` — 4 call sites (deserialization RCE) |
 
 Sentinel patches all three files in a single PR.
+
+---
+
+## Technical Stack
+
+- **Orchestrator**: Python / FastAPI — manages container lifecycle, retry loop, GitHub API
+- **Sandbox**: Docker (JDK 17, Maven 3.9.15, Gradle 9.4.1, OSV-Scanner, Python 3 + pip)
+- **Scanning**: `mvn dependency:list` / `gradle dependencies` / `pip list` + OSV REST API; OSV-Scanner (fallback)
+- **Reasoning**: Multi-provider — Anthropic Claude (default) or Google Gemini
+- **Version control**: PyGithub — fork, branch, commit, PR
+
+### LLM provider comparison
+
+| | Claude Opus 4.8 (default) | Gemini 2.5 Flash |
+|---|---|---|
+| Complex multi-file patches | Excellent | Good |
+| JSON output reliability | Excellent | Good |
+| Prompt caching on retries | Yes (~80% savings) | No |
+| Speed | Moderate | Fast |
+| Cost per run | Higher | Lower |
+
+Set `ANTHROPIC_API_KEY` for Claude, `GEMINI_API_KEY` for Gemini, or both (Claude wins when both set).  
+Override with `ANTHROPIC_MODEL=claude-sonnet-4-6` or `GEMINI_MODEL=gemini-2.5-pro`.
 
 ---
 
