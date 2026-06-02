@@ -38,7 +38,7 @@ def load_env_override(yaml_string: str) -> dict:
     """
     if not yaml_string:
         return {}
-    return yaml.load(yaml_string)   # UNSAFE: attacker-controlled string
+    return yaml.load(yaml_string) or {}   # UNSAFE: attacker-controlled string
 
 
 def load_all_configs(*extra_paths: str) -> dict:

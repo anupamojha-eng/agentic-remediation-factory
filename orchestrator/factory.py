@@ -122,7 +122,7 @@ class RemediationFactory:
                     return None
 
                 print(f"Verifying build with: {verify_cmd}")
-                verify = container.exec_run(verify_cmd, workdir=workspace)
+                verify = container.exec_run(["bash", "-c", verify_cmd], workdir=workspace)
                 if verify.exit_code == 0:
                     print("Build verified successfully.")
                     return actor.create_pull_request(cves)
@@ -387,7 +387,7 @@ class RemediationFactory:
                 workdir=workspace
             ).exit_code == 0
             if has_pytest:
-                return "pip3 install --user -r requirements.txt -q && python3 -m pytest -q --tb=short 2>&1 || pip3 install --user -r requirements.txt -q"
+                return "pip3 install --user -r requirements.txt pytest -q && python3 -m pytest -q --tb=short 2>&1"
             return "pip3 install --user -r requirements.txt -q && pip3 check"
         # Gradle
         if container.exec_run("test -f gradlew", workdir=workspace).exit_code == 0:

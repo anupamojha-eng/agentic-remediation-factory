@@ -217,16 +217,26 @@ class SecurityAgentClient:
         """
         Return grep patterns for source files that make these CVEs exploitable.
         Checks the known-pattern map first, then falls back to the LLM.
+        Returns an ordered list: _PYTHON_ALWAYS_CHECK first, then known patterns, then LLM.
         """
-        patterns: set = set()
-        unknown = []
+        # Use ordered list + seen-set to preserve priority and deduplicate
+        patterns: list = []
+        seen: set = set()
+
+        def _add(p):
+            if p not in seen:
+                patterns.append(p)
+                seen.add(p)
 
         if build_system == "python":
-            patterns.update(self._PYTHON_ALWAYS_CHECK)
+            for p in self._PYTHON_ALWAYS_CHECK:
+                _add(p)
 
+        unknown = []
         for ghsa in ghsa_ids:
             if ghsa in self._KNOWN_PATTERNS:
-                patterns.update(self._KNOWN_PATTERNS[ghsa])
+                for p in self._KNOWN_PATTERNS[ghsa]:
+                    _add(p)
             else:
                 unknown.append(ghsa)
 
@@ -253,11 +263,13 @@ Return ONLY a JSON array of grep strings. [] if purely library-internal."""
                 )
                 result = json.loads(_strip_json_fences(text))
                 if isinstance(result, list):
-                    patterns.update(p for p in result if isinstance(p, str))
+                    for p in result:
+                        if isinstance(p, str):
+                            _add(p)
             except Exception as e:
                 print(f"  Pattern detection error: {e}")
 
-        return list(patterns)
+        return patterns
 
     def get_remediation_plan(self, ghsa_ids, files_content, build_system="maven", build_error=None):
         """

@@ -74,8 +74,11 @@ class RemediationActor:
         # Source file extension depends on the language
         src_ext = "*.py" if self.build_system == "python" else "*.java"
         print(f"  Scanning source tree for exploitable patterns: {patterns}")
+        MAX_SOURCE_FILES = 10
         files = {}
-        for pattern in patterns[:5]:  # cap to avoid overly broad searches
+        for pattern in patterns:  # priority-ordered: _PYTHON_ALWAYS_CHECK first
+            if len(files) >= MAX_SOURCE_FILES:
+                break
             # Use list form so Docker exec runs grep directly (no shell needed)
             result = self.container.exec_run(
                 ["grep", "-rl", f"--include={src_ext}", pattern, "."],
