@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=82.0.0", "setuptools-scm"]
+requires = ["setuptools>=82.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -34,3 +34,7 @@ sentinel = "orchestrator.cli:sentinel"
 [project.urls]
 Homepage = "https://github.com/anupamojha-eng/agentic-remediation-factory"
 Issues = "https://github.com/anupamojha-eng/agentic-remediation-factory/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["orchestrator*"]
