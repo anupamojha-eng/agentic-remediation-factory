@@ -25,7 +25,11 @@ dependencies = [
     "uvicorn>=0.29.0",
     "python-dotenv>=1.0.1",
     "requests>=2.31.0",
+    "click>=8.1.0",
 ]
+
+[project.scripts]
+sentinel = "orchestrator.cli:sentinel"
 
 [project.urls]
 Homepage = "https://github.com/anupamojha-eng/agentic-remediation-factory"

@@ -123,11 +123,14 @@ class RemediationFactory:
 
                 print(f"Verifying build with: {verify_cmd}")
                 verify = container.exec_run(["bash", "-c", verify_cmd], workdir=workspace)
+                verify_output = verify.output.decode("utf-8", errors="replace")
                 if verify.exit_code == 0:
                     print("Build verified successfully.")
+                    actor.audit["attempt"] = attempt
+                    actor.audit["build_output"] = verify_output
                     return actor.create_pull_request(cves)
 
-                build_error = self._extract_build_error(verify.output.decode())
+                build_error = self._extract_build_error(verify_output)
                 print(f"Build failed (attempt {attempt}/{MAX_PATCH_ATTEMPTS}):\n{build_error}")
 
             print(f"Build still failing after {MAX_PATCH_ATTEMPTS} attempts — giving up.")

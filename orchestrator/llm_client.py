@@ -209,6 +209,17 @@ class SecurityAgentClient:
         "pickle.load(",
     ]
 
+    _JAVA_ALWAYS_CHECK: list = [
+        "new ObjectInputStream(",             # Java deserialization RCE (equivalent of pickle)
+        "Runtime.getRuntime().exec(",          # OS command injection
+        "new ProcessBuilder(",                 # OS command injection
+        'MessageDigest.getInstance("MD5"',     # weak hashing
+        'MessageDigest.getInstance("SHA-1"',   # weak hashing
+        "new Random(",                         # insecure randomness — use SecureRandom
+        "DocumentBuilderFactory.newInstance(", # XML External Entity (XXE)
+        "XMLInputFactory.newInstance(",        # XXE
+    ]
+
     def __init__(self):
         self.llm = _make_provider()
         self.model_id = self.llm.model_id  # kept for OTel label compatibility
@@ -230,6 +241,9 @@ class SecurityAgentClient:
 
         if build_system == "python":
             for p in self._PYTHON_ALWAYS_CHECK:
+                _add(p)
+        elif build_system in ("maven", "gradle"):
+            for p in self._JAVA_ALWAYS_CHECK:
                 _add(p)
 
         unknown = []
