@@ -2,6 +2,7 @@
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
+[![PyPI](https://img.shields.io/pypi/v/sentinel-remediation.svg)](https://pypi.org/project/sentinel-remediation/)
 [![Ecosystems](https://img.shields.io/badge/ecosystems-Java%20%7C%20Python-green.svg)](#supported-ecosystems)
 
 **Sentinel closes the "last mile" of CVE remediation.**  
@@ -14,7 +15,37 @@ patch build files + source code → verify build in sandbox → open PR
 
 **Live demo PRs opened by Sentinel:**
 - Java: [monitorjbl/excel-streaming-reader#271](https://github.com/monitorjbl/excel-streaming-reader/pull/271) — Log4Shell + Apache POI CVEs, `pom.xml` + Java source patched
-- Python: [vulnerable-data-pipeline](https://github.com/anupamojha-eng/vulnerable-data-pipeline) — 5 PyPI CVEs, `requirements.txt` + `config.py` + `cache.py` patched
+- Python: [vulnerable-data-pipeline#2](https://github.com/anupamojha-eng/vulnerable-data-pipeline/pull/2) — 5 PyPI CVEs, `requirements.txt` + `config.py` + `cache.py` patched
+
+---
+
+## Install
+
+```bash
+pip install sentinel-remediation
+```
+
+Requires Docker running locally. Set credentials in a `.env` file (see [Quick start](#quick-start)).
+
+---
+
+## Usage
+
+```bash
+# Fix CVEs in any public GitHub repo
+sentinel fix-cve --repo https://github.com/org/repo
+
+# Target a specific branch
+sentinel fix-cve --repo https://github.com/org/repo --branch develop
+
+# Force a specific LLM provider
+sentinel fix-cve --repo https://github.com/org/repo --llm gemini
+
+# Override the model
+sentinel fix-cve --repo https://github.com/org/repo --llm anthropic --model claude-sonnet-4-6
+```
+
+Sentinel forks the repo, opens a sandbox container, scans, patches, verifies, and opens a PR — typically in under 3 minutes.
 
 ---
 
@@ -27,7 +58,7 @@ patch build files + source code → verify build in sandbox → open PR
 | Renovate | ✅ | ✅ | ❌ | ❌ | ✅ |
 | **Sentinel** | ✅ | ✅ | ✅ | ✅ | ✅ |
 
-Dependabot bumps versions. Sentinel bumps versions *and* fixes the dangerous call sites in your code (`yaml.load()` → `yaml.safe_load()`, `enableDefaultTyping` removal, etc.) — then proves the build still passes before touching your repo.
+Dependabot bumps versions. Sentinel bumps versions *and* fixes the dangerous call sites in your code — then proves the build still passes before touching your repo.
 
 ---
 
@@ -36,20 +67,48 @@ Dependabot bumps versions. Sentinel bumps versions *and* fixes the dangerous cal
 ### Three-layer remediation
 
 **Layer 1 — Transitive CVE detection**  
-Resolves the *complete* dependency tree (not just declared deps) using the native build tool, then queries the OSV REST API for every package including transitively pulled dependencies. Catches CVEs that arrive silently through frameworks — e.g. `snakeyaml` via Spring Boot, `urllib3` via `requests`.
+Resolves the *complete* dependency tree (not just declared deps) using the native build tool, then queries the OSV REST API for every package including transitively pulled dependencies. Catches CVEs that arrive silently through frameworks.
 
 **Layer 2 — Build file patching**  
 LLM upgrades `pom.xml`, `build.gradle`, `build.gradle.kts`, `gradle/libs.versions.toml`, `requirements.txt`, and `pyproject.toml` to the minimum safe version. Handles version variables, BOM imports, Kotlin DSL, and Gradle version catalogs.
 
-**Layer 3 — Source code patching (proactive + reactive)**  
-Greps source files for dangerous call-site patterns tied to the found CVEs:
+**Layer 3 — Source code patching**  
+Greps source files for dangerous call-site patterns — both CVE-specific and a built-in set of always-checked anti-patterns:
 
-- **Proactive (Python):** `yaml.load()` → `yaml.safe_load()`, `pickle.loads()` guarded — fires *before* any runtime error, on the first pass
-- **Reactive (Java):** when a library API change breaks compilation (e.g. POI 5.0→5.2 removes a method), Sentinel reads the failing `.java` files and implements the fix, then retries the build
+**Python anti-patterns (always checked):**
+| Pattern | Risk |
+|---------|------|
+| `yaml.load(` | RCE via unsafe deserialization |
+| `pickle.loads(` / `pickle.load(` | RCE via deserialization |
+
+**Java anti-patterns (always checked):**
+| Pattern | Risk |
+|---------|------|
+| `new ObjectInputStream(` | Java deserialization RCE |
+| `Runtime.getRuntime().exec(` | OS command injection |
+| `new ProcessBuilder(` | OS command injection |
+| `MessageDigest.getInstance("MD5"` | Weak hashing |
+| `MessageDigest.getInstance("SHA-1"` | Weak hashing |
+| `new Random(` | Insecure randomness |
+| `DocumentBuilderFactory.newInstance(` | XML External Entity (XXE) |
+| `XMLInputFactory.newInstance(` | XML External Entity (XXE) |
+
+### PR audit trail
+
+Every PR opened by Sentinel includes a structured evidence trail:
+- CVEs addressed
+- Files changed with patterns found
+- Build verification status and attempt count
+- Truncated build output (collapsible)
+- Timestamp
 
 ### Verify before merge
 
-Every patch is tested in an isolated Docker sandbox (JDK 17 + Maven/Gradle, Python 3 + pip) before the PR is opened. If the build fails, Sentinel extracts the error, feeds it back to the LLM, and retries up to 3 times. A PR is only opened when `mvn clean compile` / `pip install && pytest` exits 0.
+Every patch is tested in an isolated Docker sandbox (JDK 17 + Maven/Gradle, Python 3 + pip) before the PR is opened. If the build fails, Sentinel extracts the error, feeds it back to the LLM, and retries up to 3 times.
+
+### Fallback when PR can't be opened
+
+If the GitHub API is unavailable or rate-limited, Sentinel extracts the diff from the container and saves it as `sentinel-patch-<timestamp>.diff` locally with apply instructions. The fix is never lost.
 
 ---
 
@@ -61,7 +120,7 @@ Every patch is tested in an isolated Docker sandbox (JDK 17 + Maven/Gradle, Pyth
 | Gradle Groovy | ✅ | `gradle dependencies` | ✅ `.java` | `gradle compileJava` |
 | Gradle KTS | ✅ | `gradle dependencies` | ✅ `.java` | `gradle compileJava` |
 | Gradle version catalog | ✅ | `gradle dependencies` | ✅ `.java` | `gradle compileJava` |
-| `requirements.txt` | ✅ | `pip install` + `pip list` | ✅ `.py` | `pip install && pip check` |
+| `requirements.txt` | ✅ | `pip install` + `pip list` | ✅ `.py` | `pip install && pytest` |
 | `pyproject.toml` | ✅ | `pip install` + `pip list` | ✅ `.py` | `pip install && pytest` |
 
 ---
@@ -69,32 +128,31 @@ Every patch is tested in an isolated Docker sandbox (JDK 17 + Maven/Gradle, Pyth
 ## Quick start
 
 ```bash
-# 1. Clone and install
-git clone https://github.com/anupamojha-eng/agentic-remediation-factory
-cd agentic-remediation-factory
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+# 1. Install
+pip install sentinel-remediation
 
 # 2. Set credentials
 cp .env.example .env
 # Edit .env — add GITHUB_TOKEN and at least one LLM key:
 #   ANTHROPIC_API_KEY  (Claude — recommended, best accuracy)
 #   GEMINI_API_KEY     (Gemini Flash — cost-effective alternative)
-# Both keys can coexist; Anthropic is preferred when both are set.
 
 # 3. Build the sandbox image (one-time, ~5 min)
 docker build -t cve-fixer-sandbox:latest sandbox/
 
-# 4. Run against any public repo
-python3 orchestrator/driver.py  # starts the FastAPI service
+# 4. Run
+sentinel fix-cve --repo https://github.com/anupamojha-eng/vulnerable-data-pipeline
+```
+
+### Running via API (FastAPI server)
+
+```bash
+python3 orchestrator/driver.py  # starts on :8080
 
 curl -X POST http://localhost:8080/remediate \
   -H "Content-Type: application/json" \
-  -d '{"repo_url": "https://github.com/anupamojha-eng/vulnerable-data-pipeline",
-       "target_tag": "main"}'
+  -d '{"repo_url": "https://github.com/org/repo", "target_tag": "main"}'
 ```
-
-Sentinel forks the repo, opens a sandbox container, scans, patches, verifies, and opens a PR — typically in under 3 minutes.
 
 ---
 
@@ -104,6 +162,7 @@ Sentinel forks the repo, opens a sandbox container, scans, patches, verifies, an
 ┌─────────────────────────────────────────────────────────┐
 │                    orchestrator/                         │
 │                                                         │
+│  cli.py           `sentinel` CLI entry point            │
 │  driver.py        FastAPI service — HTTP entry point    │
 │  factory.py       RemediationFactory                    │
 │    ├─ _detect_build_system()   Maven/Gradle/Python      │
@@ -116,7 +175,9 @@ Sentinel forks the repo, opens a sandbox container, scans, patches, verifies, an
 │    ├─ get_vulnerable_code_files()  grep → source files  │
 │    ├─ get_affected_java_files()    parse compile errors  │
 │    ├─ autonomous_patch()           LLM → write → verify │
-│    └─ create_pull_request()        branch → push → PR   │
+│    ├─ create_pull_request()        branch → push → PR   │
+│    ├─ _build_pr_body()             audit trail          │
+│    └─ _patch_fallback()            save diff locally    │
 │                                                         │
 │  llm_client.py    SecurityAgentClient                   │
 │    ├─ _AnthropicProvider  Claude Opus 4.8 (default)     │
@@ -146,42 +207,25 @@ Sentinel forks the repo, opens a sandbox container, scans, patches, verifies, an
 pytest tests/test_python_support.py tests/test_patching.py \
        tests/test_build_detection.py tests/test_scanner.py -v
 
-# Docker e2e — Java (needs Docker + ANTHROPIC_API_KEY or GEMINI_API_KEY)
-pytest tests/test_e2e_docker.py -v -s
+# Docker e2e — needs Docker + LLM key
+pytest tests/test_e2e_docker.py -v -s              # Java
+pytest tests/test_e2e_python_docker.py -v -s       # Python
 
-# Docker e2e — Python (needs Docker + ANTHROPIC_API_KEY or GEMINI_API_KEY)
-pytest tests/test_e2e_python_docker.py -v -s
-
-# Source patching — Java multi-file (needs Docker + ANTHROPIC_API_KEY or GEMINI_API_KEY)
+# Source patching e2e
 pytest tests/test_java_source_patching_e2e.py -v -s
-
-# Source patching — Python multi-file (needs Docker + ANTHROPIC_API_KEY or GEMINI_API_KEY)
 pytest tests/test_python_source_patching_e2e.py -v -s
 
-# Full pipeline — real GitHub repo (needs Docker + ANTHROPIC_API_KEY or GEMINI_API_KEY + GITHUB_TOKEN)
-pytest tests/test_real_repo_e2e.py -v -s          # Java
-pytest tests/test_real_python_repo_e2e.py -v -s   # Python
+# Full pipeline — needs Docker + LLM key + GITHUB_TOKEN
+pytest tests/test_real_repo_e2e.py -v -s           # Java
+pytest tests/test_real_python_repo_e2e.py -v -s    # Python
 ```
 
 ---
 
-## Demo repository
+## Technical stack
 
-[`vulnerable-data-pipeline`](demo_repos/vulnerable-data-pipeline/) — a realistic Flask data-ingestion service with 5 known CVEs and dangerous source patterns in 2 files. Push it to GitHub to use as your own Sentinel test target.
-
-| File | Issue |
-|---|---|
-| `requirements.txt` | PyYAML 5.3.1, cryptography 3.3.2, requests 2.27.0, urllib3 1.24.1 |
-| `app/config.py` | `yaml.load()` — 3 call sites (RCE vector) |
-| `app/cache.py` | `pickle.loads()` — 4 call sites (deserialization RCE) |
-
-Sentinel patches all three files in a single PR.
-
----
-
-## Technical Stack
-
-- **Orchestrator**: Python / FastAPI — manages container lifecycle, retry loop, GitHub API
+- **CLI**: Click — `sentinel fix-cve --repo <url>`
+- **Orchestrator**: Python / FastAPI — container lifecycle, retry loop, GitHub API
 - **Sandbox**: Docker (JDK 17, Maven 3.9.15, Gradle 9.4.1, OSV-Scanner, Python 3 + pip)
 - **Scanning**: `mvn dependency:list` / `gradle dependencies` / `pip list` + OSV REST API; OSV-Scanner (fallback)
 - **Reasoning**: Multi-provider — Anthropic Claude (default) or Google Gemini
@@ -204,11 +248,12 @@ Override with `ANTHROPIC_MODEL=claude-sonnet-4-6` or `GEMINI_MODEL=gemini-2.5-pr
 
 ## Roadmap
 
+- [ ] `sentinel fix-antipatterns` — standalone anti-pattern fixing without a CVE trigger
+- [ ] Local LLM mode — Ollama + quantized model for air-gapped / zero-cost runs
+- [ ] OSV offline cache — local SQLite built from OSV data dumps, no API calls
 - [ ] Go (`go.mod`) and Rust (`Cargo.toml`) ecosystem support
-- [ ] SBOM input (CycloneDX / SPDX) for repos without a build tool available
 - [ ] GitHub Actions integration — trigger on Dependabot alert webhook
 - [ ] Container image scanning — pair with Chainguard Wolfi or distroless base images
-- [ ] Web dashboard for PR status and audit trail
 
 ---
 
