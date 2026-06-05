@@ -184,6 +184,11 @@ curl -X POST http://localhost:8080/remediate \
 │    ├─ _GeminiProvider     Gemini 2.5 Flash (alt)        │
 │    ├─ get_vulnerable_patterns()    CVE → grep strings   │
 │    └─ get_remediation_plan()       full patch plan      │
+│                                                         │
+│  telemetry.py     Observability                         │
+│    ├─ setup_telemetry()   OTLP or console export        │
+│    ├─ TokenUsageTracker   per-run token + cost report   │
+│    └─ record_llm_tokens() OTel counters + cost tracker  │
 └─────────────────────────────────────────────────────────┘
                            │
                            │ Docker SDK
@@ -219,6 +224,59 @@ pytest tests/test_python_source_patching_e2e.py -v -s
 pytest tests/test_real_repo_e2e.py -v -s           # Java
 pytest tests/test_real_python_repo_e2e.py -v -s    # Python
 ```
+
+---
+
+## Observability
+
+Every run emits OTel traces and metrics. Set `OTEL_EXPORTER_OTLP_ENDPOINT` to ship to any backend (Grafana, Datadog, Honeycomb). Defaults to console output if not set.
+
+### Traces
+
+| Span | Attributes |
+|------|-----------|
+| `sentinel.remediation` | `repo`, `branch`, `build_system`, `cve_count`, `pr_url` |
+| `sentinel.scan` | `cve_count`, `cves` |
+| `sentinel.patch` | `attempt` |
+| `sentinel.llm_call` | `stage`, `model` |
+| `sentinel.verify` | `attempt`, `exit_code` |
+| `sentinel.pr_create` | `pr_url`, `success` |
+
+### Metrics
+
+| Metric | Type | Tags |
+|--------|------|------|
+| `sentinel.remediation_duration_seconds` | histogram | `build_system` |
+| `sentinel.scan_duration_seconds` | histogram | `build_system` |
+| `sentinel.verify_duration_seconds` | histogram | `build_system`, `attempt` |
+| `sentinel.cves_found_total` | counter | `build_system` |
+| `sentinel.patch_attempts_total` | counter | `build_system`, `attempt` |
+| `sentinel.pr_opened_total` | counter | `build_system`, `success` |
+| `sentinel.llm_tokens_total` | counter | `model`, `stage`, `repo`, `type` |
+| `sentinel.llm_cost_usd_total` | counter | `model`, `stage`, `repo` |
+
+### Token & cost report
+
+Printed at the end of every run — shows per-stage token usage, cache hits, cache savings in dollars, and total cost:
+
+```
+════════════════════════════════════════════════════════════════════════════════
+  Sentinel Token & Cost Report
+  Repo: https://github.com/org/repo
+════════════════════════════════════════════════════════════════════════════════
+  Stage                  Model                        In    Out  Cache↓  Cache↑     Cost
+  ──────────────────────────────────────────────────────────────────────────────
+  pattern_detect         claude-opus-4-8            1,234    89       —       —  $0.0185
+  patch                  claude-opus-4-8           12,456   823       —   8,234  $0.0234
+                         cache saved:                                            -$0.1235
+  ──────────────────────────────────────────────────────────────────────────────
+  TOTAL                                            13,690   912       —   8,234  $0.0419
+  Cache savings:....................................                      -$0.1235
+  Net cost (after savings):.........................                       $0.0419
+════════════════════════════════════════════════════════════════════════════════
+```
+
+Cache↓ = tokens read from cache · Cache↑ = tokens written to cache
 
 ---
 
