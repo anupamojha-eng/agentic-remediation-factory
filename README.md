@@ -373,13 +373,22 @@ The long-term goal is a `sentinel-patcher` model — a small quantized model fin
                             │  ~4,000+ examples
                             ▼
  ┌──────────────────────────────────────────────────────────────────────┐
- │  FINE-TUNING                                            in progress ⚙│
+ │  FINE-TUNING                                                built ✅ │
  │                                                                       │
- │  Base model:  Qwen2.5-Coder-7B  (strong structured output)          │
- │  Framework:   Unsloth  (LoRA, runs on consumer GPU or Apple Silicon) │
- │  Output:      sentinel-patcher-7b-q4.gguf  (~4GB)                   │
+ │  training/train.py        Unsloth QLoRA on Qwen2.5-Coder-7B         │
+ │       └─ runs anywhere with GPU: Colab, Modal, RunPod               │
+ │       └─ exports Q4_K_M GGUF (~4GB)                                 │
+ │       └─ pushes to Hugging Face Hub                                 │
  │                                                                       │
- │  Triggered:   manually, or when training set grows by 500+ examples  │
+ │  training/train_modal.py  Serverless GPU wrapper                    │
+ │       └─ modal run training/train_modal.py                          │
+ │       └─ spins up A100 on demand (~$5/run, ~30 min)                 │
+ │       └─ tears down automatically when done                         │
+ │                                                                       │
+ │  Triggered by: retrain.yml GitHub Actions                           │
+ │       └─ on push to sentinel_self.jsonl (new verified patches)      │
+ │       └─ weekly cron (Sunday 2am UTC, fresh OSV data)               │
+ │       └─ manually via workflow_dispatch                              │
  └──────────────────────────┬───────────────────────────────────────────┘
                             │
                             ▼
@@ -402,19 +411,19 @@ The long-term goal is a `sentinel-patcher` model — a small quantized model fin
  └──────────────┬───────────────────────────┬──────────────────────────┘
                 │ pass ✅                    │ fail ❌
                 ▼                            ▼
- ┌──────────────────────────┐   ┌────────────────────────────────────┐
- │  DEPLOY                  │   │  ALERT                             │
- │                 planned ⏳│   │                                    │
- │  Embed .gguf into        │   │  CI job fails, team notified       │
- │  Docker sandbox image    │   │  Previous model remains in service │
- │                          │   └────────────────────────────────────┘
- │  sentinel fix-cve calls  │
- │  localhost:8080/v1/chat  │
- │  instead of Anthropic API│
- │                          │
- │  Zero external network   │
- │  calls — fully air-gapped│
- └──────────────────────────┘
+ ┌──────────────────────────────┐  ┌────────────────────────────────┐
+ │  DEPLOY              planned⏳│  │  ALERT                         │
+ │                              │  │                                │
+ │  Published to HF Hub:        │  │  CI fails, previous model kept │
+ │  anupamojha/sentinel-patcher │  └────────────────────────────────┘
+ │                              │
+ │  retrain.yml rebuilds Docker │
+ │  image with new model ref    │
+ │                              │
+ │  Uses llama.cpp server at    │
+ │  localhost:8080 — zero       │
+ │  external API calls          │
+ └──────────────────────────────┘
                 │
                 ▼ feedback
  ┌──────────────────────────────────────────────────────────────────────┐
@@ -431,7 +440,7 @@ The long-term goal is a `sentinel-patcher` model — a small quantized model fin
 ### Running the pipeline today
 
 ```bash
-# 1. Collect training data
+# 1. Collect training data (~4,000 examples from OSV + GitHub)
 python training/collect_osv.py --ecosystems Maven PyPI --limit 2000 \
     --out training/data/osv.jsonl
 
@@ -443,25 +452,37 @@ python training/evaluate.py --split training/data/osv.jsonl \
     --eval-out training/data/eval.jsonl \
     --train-out training/data/train.jsonl
 
-# 3. Evaluate baseline (Claude Haiku — reference quality)
+# 3a. Train locally (requires GPU — Google Colab or similar)
+HF_TOKEN=... python training/train.py \
+    --data training/data/train.jsonl \
+    --hf-repo anupamojha/sentinel-patcher-7b \
+    --push-to-hub
+
+# 3b. Train on Modal cloud GPU (~$5, A100, ~30 min — no local GPU needed)
+pip install modal && modal setup
+modal run training/train_modal.py \
+    --hf-repo anupamojha/sentinel-patcher-7b
+
+# 4. Evaluate model quality (CI gate)
 ANTHROPIC_API_KEY=... python training/evaluate.py \
     --eval-set training/data/eval.jsonl \
     --provider anthropic --threshold 0.75
 
-# 4. Enable self-improvement on production runs
+# 5. Enable self-improvement on production runs
 SENTINEL_TRAINING_LOG=training/data/sentinel_self.jsonl \
     sentinel fix-cve --repo https://github.com/org/repo
 ```
 
-The CI workflow (`.github/workflows/model-eval.yml`) runs steps 1 and 3 automatically on every push to `training/` and weekly on schedule.
+**CI workflows:**
+- `.github/workflows/model-eval.yml` — runs evaluation on every push to `training/`, weekly
+- `.github/workflows/retrain.yml` — triggers full retraining when `sentinel_self.jsonl` grows or weekly; requires `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`, `HF_TOKEN` secrets in GitHub
 
 ---
 
 ## Roadmap
 
-- [ ] `training/train.py` — Unsloth LoRA fine-tuning script
-- [ ] Quantize output to Q4_K_M with llama.cpp
-- [ ] Embed model in Docker sandbox image via llama.cpp server
+- [ ] Embed model in Docker sandbox image via llama.cpp server (train.py + train_modal.py built)
+- [ ] Wire `SENTINEL_LOCAL_MODEL` env var into llm_client.py as a third provider
 - [ ] `sentinel fix-antipatterns` — standalone anti-pattern fixing without a CVE trigger
 - [ ] OSV offline cache — local SQLite built from OSV data dumps, no API calls
 - [ ] Go (`go.mod`) and Rust (`Cargo.toml`) ecosystem support

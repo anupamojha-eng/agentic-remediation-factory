@@ -1,0 +1,153 @@
+name: Retrain sentinel-patcher
+
+on:
+  # Trigger when training data grows (new verified patches logged)
+  push:
+    paths:
+      - 'training/data/sentinel_self.jsonl'
+  # Weekly refresh on public OSV data
+  schedule:
+    - cron: '0 2 * * 0'   # Sunday 2am UTC
+  # Manual trigger with optional overrides
+  workflow_dispatch:
+    inputs:
+      skip_collect:
+        description: 'Skip data collection (use existing train.jsonl)'
+        type: boolean
+        default: false
+      hf_repo:
+        description: 'Hugging Face repo to push model to'
+        default: 'anupamojha/sentinel-patcher-7b'
+      threshold:
+        description: 'Minimum pass@1 rate for quality gate'
+        default: '0.75'
+
+jobs:
+  check-data-size:
+    name: Check if retraining is warranted
+    runs-on: ubuntu-latest
+    outputs:
+      should_train: ${{ steps.check.outputs.should_train }}
+      example_count: ${{ steps.check.outputs.example_count }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history to diff
+
+      - name: Count training examples
+        id: check
+        run: |
+          TRAIN_FILE="training/data/train.jsonl"
+          SELF_FILE="training/data/sentinel_self.jsonl"
+
+          count=0
+          [ -f "$TRAIN_FILE" ] && count=$(wc -l < "$TRAIN_FILE")
+          [ -f "$SELF_FILE" ]  && count=$((count + $(wc -l < "$SELF_FILE")))
+
+          echo "example_count=$count" >> $GITHUB_OUTPUT
+
+          # Retrain if we have at least 100 examples
+          # (lower threshold for first run; raise to 500 once pipeline is stable)
+          if [ "$count" -ge 100 ]; then
+            echo "should_train=true" >> $GITHUB_OUTPUT
+            echo "✅ $count examples — will retrain"
+          else
+            echo "should_train=false" >> $GITHUB_OUTPUT
+            echo "⏭️  Only $count examples — skipping (need 100+)"
+          fi
+
+  train:
+    name: Fine-tune on Modal A100
+    needs: check-data-size
+    if: needs.check-data-size.outputs.should_train == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install Modal + deps
+        run: pip install modal requests
+
+      - name: Authenticate Modal
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+        run: modal token set --token-id $MODAL_TOKEN_ID --token-secret $MODAL_TOKEN_SECRET
+
+      - name: Set Modal secrets (HF + GitHub tokens)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          modal secret create hf-token HF_TOKEN=$HF_TOKEN --force
+          modal secret create github-token GITHUB_TOKEN=$GITHUB_TOKEN --force
+
+      - name: Collect training data
+        if: ${{ !inputs.skip_collect }}
+        run: |
+          python training/collect_osv.py \
+            --ecosystems Maven PyPI \
+            --limit 2000 \
+            --out training/data/osv_raw.jsonl
+
+          # Merge with self-logged data if it exists
+          if [ -f training/data/sentinel_self.jsonl ]; then
+            cat training/data/osv_raw.jsonl training/data/sentinel_self.jsonl \
+              > training/data/merged.jsonl
+          else
+            cp training/data/osv_raw.jsonl training/data/merged.jsonl
+          fi
+
+          python training/evaluate.py \
+            --split training/data/merged.jsonl \
+            --split-ratio 0.10 \
+            --eval-out training/data/eval.jsonl \
+            --train-out training/data/train.jsonl
+
+          echo "Training examples: $(wc -l < training/data/train.jsonl)"
+          echo "Eval examples:     $(wc -l < training/data/eval.jsonl)"
+
+      - name: Run training pipeline on Modal
+        run: |
+          modal run training/train_modal.py \
+            --hf-repo "${{ inputs.hf_repo || 'anupamojha/sentinel-patcher-7b' }}" \
+            --threshold "${{ inputs.threshold || '0.75' }}"
+
+      - name: Post training summary
+        if: always()
+        run: |
+          echo "## Training Pipeline Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Examples used:** ${{ needs.check-data-size.outputs.example_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **HF Repo:** [${{ inputs.hf_repo || 'anupamojha/sentinel-patcher-7b' }}](https://huggingface.co/${{ inputs.hf_repo || 'anupamojha/sentinel-patcher-7b' }})" >> $GITHUB_STEP_SUMMARY
+          echo "- **Threshold:** ${{ inputs.threshold || '0.75' }}" >> $GITHUB_STEP_SUMMARY
+
+  rebuild-docker:
+    name: Rebuild sandbox image with new model
+    needs: train
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update model reference in Dockerfile
+        run: |
+          HF_REPO="${{ inputs.hf_repo || 'anupamojha/sentinel-patcher-7b' }}"
+          # Replace or append the SENTINEL_LOCAL_MODEL env in Dockerfile
+          if grep -q "SENTINEL_LOCAL_MODEL" sandbox/Dockerfile; then
+            sed -i "s|ENV SENTINEL_LOCAL_MODEL=.*|ENV SENTINEL_LOCAL_MODEL=hf.co/${HF_REPO}|" sandbox/Dockerfile
+          else
+            echo "ENV SENTINEL_LOCAL_MODEL=hf.co/${HF_REPO}" >> sandbox/Dockerfile
+          fi
+
+      - name: Commit updated Dockerfile
+        run: |
+          git config user.email "sentinel-ci@github.com"
+          git config user.name "Sentinel CI"
+          git add sandbox/Dockerfile
+          git diff --staged --quiet || git commit -m "chore: update model reference to latest sentinel-patcher"
+          git push
