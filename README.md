@@ -31,6 +31,8 @@ Requires Docker running locally. Set credentials in a `.env` file (see [Quick st
 
 ## Usage
 
+### Fix CVEs in a single repo
+
 ```bash
 # Fix CVEs in any public GitHub repo
 sentinel fix-cve --repo https://github.com/org/repo
@@ -46,6 +48,38 @@ sentinel fix-cve --repo https://github.com/org/repo --llm anthropic --model clau
 ```
 
 Sentinel forks the repo, opens a sandbox container, scans, patches, verifies, and opens a PR — typically in under 3 minutes.
+
+---
+
+### Scan an entire GitHub org
+
+```bash
+# Scan all repos — generates an HTML report, no PRs created (safe by default)
+sentinel scan-org --org my-org
+
+# Filter by severity and language
+sentinel scan-org --org my-org --severity CRITICAL HIGH --language java python
+
+# Scope to repos matching a pattern
+sentinel scan-org --org my-org --include "platform-*" --exclude "*-test"
+
+# Scan and create remediation PRs for all CRITICAL findings
+sentinel scan-org --org my-org --severity CRITICAL --create-prs
+
+# Save report to a specific path, also output JSON
+sentinel scan-org --org my-org --report security-report.html --json-out results.json
+
+# GitHub Enterprise
+sentinel scan-org --org my-org --github-url https://github.mycompany.com/api/v3
+```
+
+`scan-org` runs in **dry-run mode by default** — it scans every repo and generates a report but does not touch any code or open any PRs. Pass `--create-prs` to enable full remediation.
+
+The HTML report shows:
+- Summary: repos scanned, affected, CVEs by severity, PRs created
+- Per-repo CVE table with advisory IDs, affected packages, fix versions
+- List of clean repos
+- Any scan errors
 
 ---
 
@@ -162,8 +196,19 @@ curl -X POST http://localhost:8080/remediate \
 ┌─────────────────────────────────────────────────────────┐
 │                    orchestrator/                         │
 │                                                         │
-│  cli.py           `sentinel` CLI entry point            │
+│  cli.py           `sentinel` CLI — fix-cve + scan-org   │
 │  driver.py        FastAPI service — HTTP entry point    │
+│                                                         │
+│  org_scanner.py   OrgScanner                           │
+│    ├─ scan()              iterate repos → quick scan    │
+│    ├─ _detect_and_extract_deps()  GitHub contents API  │
+│    ├─ _query_osv()        OSV batch API, severity map   │
+│    └─ create_prs_for_results()    delegate to factory   │
+│                                                         │
+│  report.py        ReportGenerator                      │
+│    ├─ generate_html()     professional HTML report      │
+│    └─ generate_json()     machine-readable JSON output  │
+│                                                         │
 │  factory.py       RemediationFactory                    │
 │    ├─ _detect_build_system()   Maven/Gradle/Python      │
 │    ├─ _scan_internal()         resolve deps → OSV API   │
