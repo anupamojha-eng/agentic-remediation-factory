@@ -304,10 +304,120 @@ Override with `ANTHROPIC_MODEL=claude-sonnet-4-6` or `GEMINI_MODEL=gemini-2.5-pr
 
 ---
 
+## Fine-tuned local model (roadmap)
+
+The long-term goal is a `sentinel-patcher` model — a small quantized model fine-tuned specifically on CVE patching — embedded directly inside the Docker sandbox image. This eliminates all external API calls and makes Sentinel fully air-gapped.
+
+### MLOps pipeline
+
+```
+ ┌──────────────────────────────────────────────────────────────────────┐
+ │  DATA COLLECTION                                             built ✅ │
+ │                                                                       │
+ │  training/collect_osv.py    OSV data dumps (Maven + PyPI)            │
+ │       └─ synthetic pairs: vulnerable build file → patched file       │
+ │                                                                       │
+ │  training/collect_github.py  GitHub security fix PRs                 │
+ │       └─ real before/after diffs from merged security PRs            │
+ │                                                                       │
+ │  training/sentinel_logger.py  Self-improvement loop                  │
+ │       └─ every verified Sentinel run → appended to train set         │
+ │                                                                       │
+ │  All output → training/data/train.jsonl  (chat JSONL format)        │
+ └──────────────────────────┬───────────────────────────────────────────┘
+                            │  ~4,000+ examples
+                            ▼
+ ┌──────────────────────────────────────────────────────────────────────┐
+ │  FINE-TUNING                                            in progress ⚙│
+ │                                                                       │
+ │  Base model:  Qwen2.5-Coder-7B  (strong structured output)          │
+ │  Framework:   Unsloth  (LoRA, runs on consumer GPU or Apple Silicon) │
+ │  Output:      sentinel-patcher-7b-q4.gguf  (~4GB)                   │
+ │                                                                       │
+ │  Triggered:   manually, or when training set grows by 500+ examples  │
+ └──────────────────────────┬───────────────────────────────────────────┘
+                            │
+                            ▼
+ ┌──────────────────────────────────────────────────────────────────────┐
+ │  EVALUATION (CI QUALITY GATE)                                built ✅ │
+ │                                                                       │
+ │  training/evaluate.py  runs inference on held-out eval.jsonl         │
+ │                                                                       │
+ │  Scores each prediction on 5 dimensions:                             │
+ │    json_valid       output parses as valid JSON                      │
+ │    schema_valid     patches / changes / analysis keys present        │
+ │    files_match      all expected files patched                       │
+ │    version_correct  fixed version present, vulnerable version gone   │
+ │    no_regression    non-security lines preserved unchanged           │
+ │                                                                       │
+ │  pass@1 = all 5 pass    threshold: 80%                               │
+ │                                                                       │
+ │  GitHub Actions runs this on every model update + weekly schedule    │
+ │  CI fails if pass@1 < threshold → previous model kept               │
+ └──────────────┬───────────────────────────┬──────────────────────────┘
+                │ pass ✅                    │ fail ❌
+                ▼                            ▼
+ ┌──────────────────────────┐   ┌────────────────────────────────────┐
+ │  DEPLOY                  │   │  ALERT                             │
+ │                 planned ⏳│   │                                    │
+ │  Embed .gguf into        │   │  CI job fails, team notified       │
+ │  Docker sandbox image    │   │  Previous model remains in service │
+ │                          │   └────────────────────────────────────┘
+ │  sentinel fix-cve calls  │
+ │  localhost:8080/v1/chat  │
+ │  instead of Anthropic API│
+ │                          │
+ │  Zero external network   │
+ │  calls — fully air-gapped│
+ └──────────────────────────┘
+                │
+                ▼ feedback
+ ┌──────────────────────────────────────────────────────────────────────┐
+ │  SELF-IMPROVEMENT LOOP                                       built ✅ │
+ │                                                                       │
+ │  Set SENTINEL_TRAINING_LOG=training/data/sentinel_self.jsonl        │
+ │  Every verified patch (build passes) → appended to training data     │
+ │  When dataset grows by 500+ examples → trigger fine-tuning again     │
+ │                                                                       │
+ │  Model improves on the exact CVEs it encounters in production        │
+ └──────────────────────────────────────────────────────────────────────┘
+```
+
+### Running the pipeline today
+
+```bash
+# 1. Collect training data
+python training/collect_osv.py --ecosystems Maven PyPI --limit 2000 \
+    --out training/data/osv.jsonl
+
+GITHUB_TOKEN=... python training/collect_github.py --limit 200 \
+    --out training/data/github.jsonl
+
+# 2. Split into train / eval
+python training/evaluate.py --split training/data/osv.jsonl \
+    --eval-out training/data/eval.jsonl \
+    --train-out training/data/train.jsonl
+
+# 3. Evaluate baseline (Claude Haiku — reference quality)
+ANTHROPIC_API_KEY=... python training/evaluate.py \
+    --eval-set training/data/eval.jsonl \
+    --provider anthropic --threshold 0.75
+
+# 4. Enable self-improvement on production runs
+SENTINEL_TRAINING_LOG=training/data/sentinel_self.jsonl \
+    sentinel fix-cve --repo https://github.com/org/repo
+```
+
+The CI workflow (`.github/workflows/model-eval.yml`) runs steps 1 and 3 automatically on every push to `training/` and weekly on schedule.
+
+---
+
 ## Roadmap
 
+- [ ] `training/train.py` — Unsloth LoRA fine-tuning script
+- [ ] Quantize output to Q4_K_M with llama.cpp
+- [ ] Embed model in Docker sandbox image via llama.cpp server
 - [ ] `sentinel fix-antipatterns` — standalone anti-pattern fixing without a CVE trigger
-- [ ] Local LLM mode — Ollama + quantized model for air-gapped / zero-cost runs
 - [ ] OSV offline cache — local SQLite built from OSV data dumps, no API calls
 - [ ] Go (`go.mod`) and Rust (`Cargo.toml`) ecosystem support
 - [ ] GitHub Actions integration — trigger on Dependabot alert webhook
