@@ -2,9 +2,11 @@ import docker
 import json
 import os
 import re
+import time
 import requests as _requests
 from github import Github, Auth
 from remediator import RemediationActor
+import telemetry as _tel
 
 MAX_PATCH_ATTEMPTS = 3
 
@@ -43,6 +45,13 @@ class RemediationFactory:
         return image
 
     def execute_ephemeral_fix(self, upstream_url: str, target_tag: str):
+        _tel.setup_telemetry()
+        tracker = _tel.TokenUsageTracker(upstream_url)
+        _tel.set_tracker(tracker)
+
+        tracer = _tel.get_tracer()
+        t0 = time.time()
+
         anthropic_key = os.getenv("ANTHROPIC_API_KEY")
         gemini_key = os.getenv("GEMINI_API_KEY")
         if not anthropic_key and not gemini_key:
@@ -67,77 +76,123 @@ class RemediationFactory:
             tty=True,
             environment=env,
         )
-        try:
-            auth = Auth.Token(self.gh_token)
-            gh = Github(auth=auth)
+        with tracer.start_as_current_span("sentinel.remediation") as root_span:
+            root_span.set_attribute("sentinel.repo", upstream_url)
+            root_span.set_attribute("sentinel.branch", target_tag)
+            pr_url = None
+            try:
+                auth = Auth.Token(self.gh_token)
+                gh = Github(auth=auth)
 
-            clean_url = upstream_url.strip().rstrip("/")
-            repo_path = clean_url.split("github.com/")[-1].replace(".git", "")
-            print(f"Accessing {repo_path}...")
+                clean_url = upstream_url.strip().rstrip("/")
+                repo_path = clean_url.split("github.com/")[-1].replace(".git", "")
+                print(f"Accessing {repo_path}...")
 
-            repo = gh.get_repo(repo_path)
-            fork = repo.create_fork()
-            print(f"Fork ready at {fork.html_url}")
+                repo = gh.get_repo(repo_path)
+                fork = repo.create_fork()
+                print(f"Fork ready at {fork.html_url}")
 
-            auth_url = fork.clone_url.replace("https://", f"https://{self.gh_token}@")
-            workspace = "/home/agent/workspace"
+                auth_url = fork.clone_url.replace("https://", f"https://{self.gh_token}@")
+                workspace = "/home/agent/workspace"
 
-            container.exec_run(f"rm -rf {workspace}", workdir="/")
-            container.exec_run(f"mkdir -p {workspace}", workdir="/")
+                container.exec_run(f"rm -rf {workspace}", workdir="/")
+                container.exec_run(f"mkdir -p {workspace}", workdir="/")
 
-            clone_res = container.exec_run(f"git clone {auth_url} {workspace}", workdir="/")
-            if clone_res.exit_code != 0:
-                print(f"Git Clone Failed: {clone_res.output.decode()}")
-                return None
-
-            container.exec_run(f"git remote add upstream {upstream_url}", workdir=workspace)
-            container.exec_run("git fetch upstream --tags", workdir=workspace)
-            container.exec_run(f"git checkout {target_tag}", workdir=workspace)
-
-            build_system, build_file = self._detect_build_system(container, workspace)
-            if not build_system:
-                print("Error: No supported build file found")
-                return None
-            print(f"Detected build system: {build_system} ({build_file})")
-
-            actor = RemediationActor(container, fork, build_system, build_file)
-            cves = self._scan_internal(container, workspace, build_system)
-            if not cves:
-                print("No vulnerabilities found — nothing to remediate.")
-                return None
-
-            verify_cmd = self._get_verify_command(build_system, container, workspace)
-            build_error = None
-
-            for attempt in range(1, MAX_PATCH_ATTEMPTS + 1):
-                if attempt > 1:
-                    if self._is_source_compile_error(build_error, build_system):
-                        print(f"Retry {attempt}/{MAX_PATCH_ATTEMPTS}: source errors — keeping build file, re-patching sources...")
-                    else:
-                        print(f"Retry {attempt}/{MAX_PATCH_ATTEMPTS}: build file error — restoring and re-patching...")
-                        self._restore_build_files(container, workspace, build_system, build_file)
-
-                if not actor.autonomous_patch(cves, build_error):
-                    print("Patch generation failed.")
+                clone_res = container.exec_run(f"git clone {auth_url} {workspace}", workdir="/")
+                if clone_res.exit_code != 0:
+                    print(f"Git Clone Failed: {clone_res.output.decode()}")
                     return None
 
-                print(f"Verifying build with: {verify_cmd}")
-                verify = container.exec_run(["bash", "-c", verify_cmd], workdir=workspace)
-                verify_output = verify.output.decode("utf-8", errors="replace")
-                if verify.exit_code == 0:
-                    print("Build verified successfully.")
-                    actor.audit["attempt"] = attempt
-                    actor.audit["build_output"] = verify_output
-                    return actor.create_pull_request(cves)
+                container.exec_run(f"git remote add upstream {upstream_url}", workdir=workspace)
+                container.exec_run("git fetch upstream --tags", workdir=workspace)
+                container.exec_run(f"git checkout {target_tag}", workdir=workspace)
 
-                build_error = self._extract_build_error(verify_output)
-                print(f"Build failed (attempt {attempt}/{MAX_PATCH_ATTEMPTS}):\n{build_error}")
+                build_system, build_file = self._detect_build_system(container, workspace)
+                if not build_system:
+                    print("Error: No supported build file found")
+                    return None
+                print(f"Detected build system: {build_system} ({build_file})")
+                root_span.set_attribute("sentinel.build_system", build_system)
 
-            print(f"Build still failing after {MAX_PATCH_ATTEMPTS} attempts — giving up.")
-            return None
-        finally:
-            container.stop()
-            container.remove()
+                actor = RemediationActor(container, fork, build_system, build_file)
+
+                # ── Scan ──────────────────────────────────────────────────────
+                with tracer.start_as_current_span("sentinel.scan") as scan_span:
+                    t_scan = time.time()
+                    cves = self._scan_internal(container, workspace, build_system)
+                    scan_elapsed = time.time() - t_scan
+                    scan_span.set_attribute("sentinel.cve_count", len(cves))
+                    scan_span.set_attribute("sentinel.cves", ", ".join(cves))
+                    if _tel.scan_duration:
+                        _tel.scan_duration.record(scan_elapsed, {"build_system": build_system})
+                    if _tel.cves_found_counter:
+                        _tel.cves_found_counter.add(len(cves), {"build_system": build_system})
+
+                if not cves:
+                    print("No vulnerabilities found — nothing to remediate.")
+                    return None
+
+                root_span.set_attribute("sentinel.cve_count", len(cves))
+                verify_cmd = self._get_verify_command(build_system, container, workspace)
+                build_error = None
+
+                # ── Patch + Verify loop ───────────────────────────────────────
+                for attempt in range(1, MAX_PATCH_ATTEMPTS + 1):
+                    if attempt > 1:
+                        if self._is_source_compile_error(build_error, build_system):
+                            print(f"Retry {attempt}/{MAX_PATCH_ATTEMPTS}: source errors — keeping build file, re-patching sources...")
+                        else:
+                            print(f"Retry {attempt}/{MAX_PATCH_ATTEMPTS}: build file error — restoring and re-patching...")
+                            self._restore_build_files(container, workspace, build_system, build_file)
+
+                    with tracer.start_as_current_span("sentinel.patch") as patch_span:
+                        patch_span.set_attribute("sentinel.attempt", attempt)
+                        if not actor.autonomous_patch(cves, build_error):
+                            print("Patch generation failed.")
+                            return None
+
+                    if _tel.patch_attempts_counter:
+                        _tel.patch_attempts_counter.add(1, {"build_system": build_system, "attempt": attempt})
+
+                    print(f"Verifying build with: {verify_cmd}")
+                    with tracer.start_as_current_span("sentinel.verify") as verify_span:
+                        t_verify = time.time()
+                        verify = container.exec_run(["bash", "-c", verify_cmd], workdir=workspace)
+                        verify_elapsed = time.time() - t_verify
+                        verify_output = verify.output.decode("utf-8", errors="replace")
+                        verify_span.set_attribute("sentinel.attempt", attempt)
+                        verify_span.set_attribute("sentinel.exit_code", verify.exit_code)
+                        if _tel.verify_duration:
+                            _tel.verify_duration.record(verify_elapsed, {"build_system": build_system, "attempt": str(attempt)})
+
+                    if verify.exit_code == 0:
+                        print("Build verified successfully.")
+                        actor.audit["attempt"] = attempt
+                        actor.audit["build_output"] = verify_output
+
+                        with tracer.start_as_current_span("sentinel.pr_create") as pr_span:
+                            pr_url = actor.create_pull_request(cves)
+                            pr_span.set_attribute("sentinel.pr_url", pr_url or "")
+                            pr_span.set_attribute("sentinel.success", pr_url is not None)
+
+                        if _tel.pr_opened_counter:
+                            _tel.pr_opened_counter.add(1, {"success": str(pr_url is not None), "build_system": build_system})
+
+                        root_span.set_attribute("sentinel.pr_url", pr_url or "")
+                        return pr_url
+
+                    build_error = self._extract_build_error(verify_output)
+                    print(f"Build failed (attempt {attempt}/{MAX_PATCH_ATTEMPTS}):\n{build_error}")
+
+                print(f"Build still failing after {MAX_PATCH_ATTEMPTS} attempts — giving up.")
+                return None
+            finally:
+                elapsed = time.time() - t0
+                if _tel.remediation_duration:
+                    _tel.remediation_duration.record(elapsed, {"build_system": build_system if 'build_system' in dir() else "unknown"})
+                tracker.print_report()
+                container.stop()
+                container.remove()
 
     # ── Scanning ──────────────────────────────────────────────────────────────
 

@@ -16,15 +16,8 @@ import json
 import re as _re
 import time
 
-from opentelemetry import metrics
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import ConsoleMetricExporter, PeriodicExportingMetricReader
-
-reader = PeriodicExportingMetricReader(ConsoleMetricExporter())
-metrics.set_meter_provider(MeterProvider(metric_readers=[reader]))
-meter = metrics.get_meter("remediation.agent")
-latency_hist = meter.create_histogram("llm_latency", unit="ms")
-token_counter = meter.create_counter("llm_tokens_total")
+from opentelemetry import trace as _otel_trace
+import telemetry as _tel
 
 
 # ── Provider abstraction ───────────────────────────────────────────────────────
@@ -46,9 +39,14 @@ class _LLMProvider:
         combined = cacheable_user + ("\n\n" + volatile_user if volatile_user else "")
         return self.generate(system, combined)
 
-    def record_tokens(self, prompt_tokens: int, completion_tokens: int):
-        token_counter.add(prompt_tokens, {"type": "prompt", "model": self.model_id})
-        token_counter.add(completion_tokens, {"type": "completion", "model": self.model_id})
+    def record_tokens(self, input_tokens: int, output_tokens: int,
+                      cache_write_tok: int = 0, cache_read_tok: int = 0,
+                      stage: str = "patch"):
+        _tel.record_llm_tokens(
+            stage=stage, model=self.model_id,
+            input_tok=input_tokens, output_tok=output_tokens,
+            cache_write_tok=cache_write_tok, cache_read_tok=cache_read_tok,
+        )
 
 
 class _GeminiProvider(_LLMProvider):
@@ -79,6 +77,10 @@ class _GeminiProvider(_LLMProvider):
         )
         return resp.text
 
+    def generate_cached(self, system: str, cacheable_user: str, volatile_user: str = "") -> str:
+        combined = cacheable_user + ("\n\n" + volatile_user if volatile_user else "")
+        return self.generate(system, combined)
+
 
 class _AnthropicProvider(_LLMProvider):
     def __init__(self):
@@ -90,25 +92,23 @@ class _AnthropicProvider(_LLMProvider):
         self.model_id = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
         print(f"  [LLM] Anthropic provider: {self.model_id}")
 
-    def generate(self, system: str, user: str) -> str:
+    def generate(self, system: str, user: str, stage: str = "patch") -> str:
         resp = self._client.messages.create(
             model=self.model_id,
             max_tokens=8192,
             system=system,
             messages=[{"role": "user", "content": user}],
         )
-        self.record_tokens(resp.usage.input_tokens, resp.usage.output_tokens)
+        self.record_tokens(resp.usage.input_tokens, resp.usage.output_tokens, stage=stage)
         return resp.content[0].text
 
-    def generate_cached(self, system: str, cacheable_user: str, volatile_user: str = "") -> str:
+    def generate_cached(self, system: str, cacheable_user: str, volatile_user: str = "",
+                        stage: str = "patch") -> str:
         """
         Marks `cacheable_user` with cache_control so it's cached across retries.
         When Sentinel retries a failed patch, `cacheable_user` (rules + file
         contents) is served from cache; only `volatile_user` (the new build
         error) is billed at full price.
-
-        Cache fires when the block exceeds the model's minimum (~4096 tokens for
-        Opus, ~2048 for Sonnet). File contents typically push us well past that.
         """
         content = [
             {
@@ -127,11 +127,15 @@ class _AnthropicProvider(_LLMProvider):
             messages=[{"role": "user", "content": content}],
         )
         u = resp.usage
-        self.record_tokens(u.input_tokens, u.output_tokens)
-        cache_read = getattr(u, "cache_read_input_tokens", 0) or 0
+        cache_read  = getattr(u, "cache_read_input_tokens", 0) or 0
         cache_write = getattr(u, "cache_creation_input_tokens", 0) or 0
+        self.record_tokens(u.input_tokens, u.output_tokens,
+                           cache_write_tok=cache_write, cache_read_tok=cache_read,
+                           stage=stage)
         if cache_read or cache_write:
-            print(f"  [cache] read={cache_read} write={cache_write} uncached={u.input_tokens}")
+            savings = _tel.cache_savings_usd(self.model_id, cache_read)
+            print(f"  [cache] read={cache_read:,} write={cache_write:,} "
+                  f"uncached={u.input_tokens:,}  saved=${savings:.4f}")
         return resp.content[0].text
 
 
@@ -274,6 +278,7 @@ Return ONLY a JSON array of grep strings. [] if purely library-internal."""
                 text = self.llm.generate(
                     system="Return ONLY a raw JSON array of strings. No markdown.",
                     user=prompt,
+                    stage="pattern_detect",
                 )
                 result = json.loads(_strip_json_fences(text))
                 if isinstance(result, list):
@@ -317,10 +322,16 @@ Return ONLY a JSON array of grep strings. [] if purely library-internal."""
                 ghsa_ids, build_system, build_error, files_section
             )
 
+        stage = "compile_fix" if is_compile_error else "patch"
         try:
-            text = self.llm.generate_cached(system, cacheable, volatile)
+            tracer = _tel.get_tracer()
+            with tracer.start_as_current_span(f"sentinel.llm_call") as span:
+                span.set_attribute("sentinel.stage", stage)
+                span.set_attribute("sentinel.model", self.model_id)
+                text = self.llm.generate_cached(system, cacheable, volatile, stage=stage)
             duration_ms = (time.time() - start) * 1000
-            latency_hist.record(duration_ms, {"model": self.model_id})
+            if _tel.verify_duration:  # reuse verify histogram — LLM latency logged via span
+                pass  # latency captured in span; counter updated via record_tokens
             return json.loads(_strip_json_fences(text))
         except Exception as e:
             print(f"LLM Inference Error: {e}")
