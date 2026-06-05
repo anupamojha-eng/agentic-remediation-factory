@@ -1,8 +1,18 @@
 import os
 import re
+import sys
 import base64
 from llm_client import SecurityAgentClient
 from github import Github
+
+# Optional self-improvement logging — enabled when SENTINEL_TRAINING_LOG is set
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+try:
+    from training.sentinel_logger import log_successful_patch as _log_patch
+    _TRAINING_LOG = os.getenv("SENTINEL_TRAINING_LOG")
+except ImportError:
+    _log_patch = None
+    _TRAINING_LOG = None
 
 # Maximum source file size to include in LLM prompt (bytes)
 MAX_SOURCE_FILE_BYTES = 30_000
@@ -137,7 +147,23 @@ class RemediationActor:
                 print(f"  Patch for {fname} is invalid ({err}) — aborting this attempt.")
                 return False
 
-        return all(self._write_file(fname, content) for fname, content in patches.items())
+        success = all(self._write_file(fname, content) for fname, content in patches.items())
+
+        # Self-improvement: log verified patches for future fine-tuning
+        if success and _TRAINING_LOG and _log_patch:
+            try:
+                _log_patch(
+                    ghsa_ids=ghsa_ids,
+                    files_input=files_content,
+                    patches_output=patches,
+                    changes=plan.get("changes", []),
+                    build_system=self.build_system,
+                    repo_url=self.fork.parent.html_url if self.fork.parent else self.fork.html_url,
+                )
+            except Exception:
+                pass  # never let logging break the main flow
+
+        return success
 
     def _validate_patch(self, filename: str, content: str) -> str:
         """Return an error string if the patch content is structurally invalid, else ''."""

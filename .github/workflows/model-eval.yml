@@ -1,0 +1,162 @@
+name: Model Quality Gate
+
+on:
+  # Run on every push that touches training or model code
+  push:
+    paths:
+      - 'training/**'
+      - 'orchestrator/llm_client.py'
+  # Weekly refresh — catches model drift as new CVEs are added
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: 'Inference provider'
+        required: false
+        default: 'anthropic'
+        type: choice
+        options: [anthropic, ollama]
+      threshold:
+        description: 'Minimum pass@1 rate (0.0–1.0)'
+        required: false
+        default: '0.75'
+
+jobs:
+  collect-eval-set:
+    name: Refresh eval set from OSV
+    runs-on: ubuntu-latest
+    outputs:
+      eval-set-key: ${{ steps.cache.outputs.cache-hit }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - run: pip install requests
+
+      - name: Download OSV eval sample
+        run: |
+          python training/collect_osv.py \
+            --ecosystems Maven PyPI \
+            --limit 50 \
+            --out training/data/eval_raw.jsonl
+
+      - name: Split into train / eval
+        run: |
+          python training/evaluate.py \
+            --split training/data/eval_raw.jsonl \
+            --split-ratio 0.40 \
+            --eval-out training/data/eval.jsonl \
+            --train-out training/data/train_sample.jsonl
+
+      - name: Upload eval set
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-set
+          path: training/data/eval.jsonl
+          retention-days: 7
+
+  evaluate-baseline:
+    name: Evaluate baseline (Claude Haiku)
+    needs: collect-eval-set
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - run: pip install anthropic requests
+
+      - name: Download eval set
+        uses: actions/download-artifact@v4
+        with:
+          name: eval-set
+          path: training/data/
+
+      - name: Run evaluation
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python training/evaluate.py \
+            --eval-set training/data/eval.jsonl \
+            --provider anthropic \
+            --model claude-haiku-4-5-20251001 \
+            --threshold ${{ inputs.threshold || '0.75' }} \
+            --limit 50 \
+            --out training/data/eval_results_baseline.json
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results-baseline
+          path: training/data/eval_results_baseline.json
+
+      - name: Post summary
+        if: always()
+        run: |
+          python - <<'EOF'
+          import json
+          data = json.load(open("training/data/eval_results_baseline.json"))
+          s = data["summary"]
+          passed = "✅" if data["passed_ci"] else "❌"
+          print(f"## {passed} Model Evaluation — {data['model']}")
+          print(f"| Metric | Score |")
+          print(f"|--------|-------|")
+          for k, v in s.items():
+              print(f"| {k} | {v:.1%} |")
+          print(f"\nThreshold: {data['threshold']:.0%} | Result: {'PASSED' if data['passed_ci'] else 'FAILED'}")
+          EOF
+        shell: python
+
+  evaluate-local-model:
+    name: Evaluate fine-tuned model (Ollama)
+    needs: collect-eval-set
+    runs-on: ubuntu-latest
+    # Only run when a local model artifact exists
+    if: ${{ inputs.provider == 'ollama' || false }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - run: pip install requests
+
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.ai/install.sh | sh
+
+      - name: Pull model
+        run: ollama pull ${{ inputs.model || 'sentinel-patcher:latest' }}
+
+      - name: Download eval set
+        uses: actions/download-artifact@v4
+        with:
+          name: eval-set
+          path: training/data/
+
+      - name: Run evaluation
+        run: |
+          python training/evaluate.py \
+            --eval-set training/data/eval.jsonl \
+            --provider ollama \
+            --model ${{ inputs.model || 'sentinel-patcher:latest' }} \
+            --threshold ${{ inputs.threshold || '0.75' }} \
+            --limit 50 \
+            --out training/data/eval_results_local.json
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results-local
+          path: training/data/eval_results_local.json
