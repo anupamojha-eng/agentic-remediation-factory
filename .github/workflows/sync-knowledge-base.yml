@@ -1,0 +1,58 @@
+name: Sync Knowledge Base
+
+on:
+  schedule:
+    - cron: '0 3 * * *'   # 3am UTC daily
+  workflow_dispatch:       # manual trigger
+
+jobs:
+  build-kb:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests pyyaml
+
+      - name: Build knowledge base
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scripts/build_knowledge_base.py --output .
+
+      - name: Copy KB to training/data/
+        run: |
+          mkdir -p training/data
+          cp sentinel-kb-*.sqlite training/data/sentinel-kb.sqlite
+          echo "Copied to training/data/sentinel-kb.sqlite"
+
+      - name: Commit updated KB to repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add training/data/sentinel-kb.sqlite
+          git diff --cached --quiet || git commit -m "chore: update sentinel-kb ($(date -u +%Y-%m-%d))"
+          git push
+
+      - name: Create or update kb-latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DB_FILE=$(ls sentinel-kb-*.sqlite | head -1)
+          # Rename to fixed filename for the release asset
+          cp "$DB_FILE" sentinel-kb-latest.sqlite
+          # Create the release if it doesn't exist yet
+          gh release create kb-latest \
+            --title "Knowledge Base" \
+            --notes "Nightly-rebuilt Sentinel pattern knowledge base." \
+            --latest=false 2>/dev/null || true
+          # Upload (clobber so re-runs overwrite the previous asset)
+          gh release upload kb-latest sentinel-kb-latest.sqlite --clobber

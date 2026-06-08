@@ -311,12 +311,18 @@ class SecurityAgentClient:
     def __init__(self):
         self.llm = _make_provider()
         self.model_id = self.llm.model_id  # kept for OTel label compatibility
+        from orchestrator.knowledge_base import KnowledgeBase
+        self._kb = KnowledgeBase()
 
     def get_vulnerable_patterns(self, ghsa_ids: list, build_system: str = "maven") -> list:
         """
         Return grep patterns for source files that make these CVEs exploitable.
         Checks the known-pattern map first, then falls back to the LLM.
-        Returns an ordered list: _PYTHON_ALWAYS_CHECK first, then known patterns, then LLM.
+        Returns an ordered list: always_check patterns first, then known patterns, then LLM.
+
+        Pattern source priority:
+          1. KnowledgeBase (dynamically built from Semgrep + builtins) when available
+          2. Hardcoded _PYTHON_ALWAYS_CHECK / _JAVA_ALWAYS_CHECK as fallback
         """
         # Use ordered list + seen-set to preserve priority and deduplicate
         patterns: list = []
@@ -327,12 +333,18 @@ class SecurityAgentClient:
                 patterns.append(p)
                 seen.add(p)
 
-        if build_system == "python":
-            for p in self._PYTHON_ALWAYS_CHECK:
-                _add(p)
-        elif build_system in ("maven", "gradle"):
-            for p in self._JAVA_ALWAYS_CHECK:
-                _add(p)
+        # KB-aware "always check" patterns
+        language = "python" if build_system == "python" else "java"
+        if self._kb.is_available():
+            always_check = self._kb.get_patterns(language)
+        else:
+            if build_system == "python":
+                always_check = self._PYTHON_ALWAYS_CHECK
+            else:
+                always_check = self._JAVA_ALWAYS_CHECK
+
+        for p in always_check:
+            _add(p)
 
         unknown = []
         for ghsa in ghsa_ids:
