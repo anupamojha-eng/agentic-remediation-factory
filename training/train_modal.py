@@ -159,14 +159,19 @@ def main(
     train_path = Path("training/data/train.jsonl")
     eval_path  = Path("training/data/eval.jsonl")
 
+    import sys as _sys
+    python = _sys.executable  # use the same python that launched this script
+
+    Path("training/data").mkdir(parents=True, exist_ok=True)
+
     if not skip_collect or not train_path.exists():
         print("\n[1/4] Collecting training data...")
         os.system(
-            "python training/collect_osv.py --ecosystems Maven PyPI "
+            f"{python} training/collect_osv.py --ecosystems Maven PyPI "
             "--limit 2000 --out training/data/osv_raw.jsonl"
         )
         os.system(
-            "python training/evaluate.py "
+            f"{python} training/evaluate.py "
             "--split training/data/osv_raw.jsonl "
             "--split-ratio 0.10 "
             f"--eval-out {eval_path} "
