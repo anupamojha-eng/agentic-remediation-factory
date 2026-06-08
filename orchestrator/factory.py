@@ -194,6 +194,177 @@ class RemediationFactory:
                 container.stop()
                 container.remove()
 
+    def execute_antipattern_fix(self, upstream_url: str, target_tag: str = "main",
+                                languages: list = None) -> str | None:
+        """Fork, clone, pattern-detect insecure code, patch, verify, open PR.
+
+        Skips the OSV/CVE scan entirely — looks for well-known insecure patterns
+        (unsafe deserialization, command injection, weak crypto, XXE, etc.) directly
+        in source files and patches them via LLM.
+        """
+        _tel.setup_telemetry()
+        tracker = _tel.TokenUsageTracker(upstream_url)
+        _tel.set_tracker(tracker)
+
+        tracer = _tel.get_tracer()
+        t0 = time.time()
+
+        anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+        gemini_key = os.getenv("GEMINI_API_KEY")
+        if not anthropic_key and not gemini_key:
+            print("Error: set ANTHROPIC_API_KEY (Claude) or GEMINI_API_KEY (Gemini).")
+            return None
+
+        env = {"GITHUB_TOKEN": self.gh_token}
+        if anthropic_key:
+            env["ANTHROPIC_API_KEY"] = anthropic_key
+        if gemini_key:
+            env["GEMINI_API_KEY"] = gemini_key
+        llm_provider = os.getenv("LLM_PROVIDER")
+        if llm_provider:
+            env["LLM_PROVIDER"] = llm_provider
+
+        container = self.client.containers.run(
+            image=self.image_tag,
+            command="/bin/bash",
+            detach=True,
+            tty=True,
+            environment=env,
+        )
+        build_system = None
+        with tracer.start_as_current_span("sentinel.antipattern_fix") as root_span:
+            root_span.set_attribute("sentinel.repo", upstream_url)
+            root_span.set_attribute("sentinel.branch", target_tag)
+            pr_url = None
+            try:
+                auth = Auth.Token(self.gh_token)
+                gh = Github(auth=auth)
+
+                clean_url = upstream_url.strip().rstrip("/")
+                repo_path = clean_url.split("github.com/")[-1].replace(".git", "")
+                print(f"Accessing {repo_path}...")
+
+                repo = gh.get_repo(repo_path)
+                fork = repo.create_fork()
+                print(f"Fork ready at {fork.html_url}")
+
+                auth_url = fork.clone_url.replace("https://", f"https://{self.gh_token}@")
+                workspace = "/home/agent/workspace"
+
+                container.exec_run(f"rm -rf {workspace}", workdir="/")
+                container.exec_run(f"mkdir -p {workspace}", workdir="/")
+
+                clone_res = container.exec_run(f"git clone {auth_url} {workspace}", workdir="/")
+                if clone_res.exit_code != 0:
+                    print(f"Git Clone Failed: {clone_res.output.decode()}")
+                    return None
+
+                container.exec_run(f"git remote add upstream {upstream_url}", workdir=workspace)
+                container.exec_run("git fetch upstream --tags", workdir=workspace)
+                container.exec_run(f"git checkout {target_tag}", workdir=workspace)
+
+                # If languages were specified, use the first recognised one to pick build system
+                if languages:
+                    lang = languages[0].lower()
+                    if lang == "python":
+                        # Find the python build file present in the repo
+                        for bf in ("requirements.txt", "Pipfile", "pyproject.toml"):
+                            if container.exec_run(f"test -f {bf}", workdir=workspace).exit_code == 0:
+                                build_system, build_file = "python", bf
+                                break
+                        else:
+                            build_system, build_file = "python", "requirements.txt"
+                    elif lang == "java":
+                        for bs, bf in [("maven", "pom.xml"), ("gradle", "build.gradle.kts"), ("gradle", "build.gradle")]:
+                            if container.exec_run(f"test -f {bf}", workdir=workspace).exit_code == 0:
+                                build_system, build_file = bs, bf
+                                break
+                        else:
+                            build_system, build_file = "maven", "pom.xml"
+
+                if not build_system:
+                    build_system, build_file = self._detect_build_system(container, workspace)
+                if not build_system:
+                    print("Error: No supported build file found")
+                    return None
+                print(f"Detected build system: {build_system} ({build_file})")
+                root_span.set_attribute("sentinel.build_system", build_system)
+
+                actor = RemediationActor(container, fork, build_system, build_file)
+
+                # ── Pattern detection (no OSV scan) ───────────────────────────
+                print("Scanning source files for insecure patterns (no CVE scan)...")
+                vulnerable_files = actor.get_vulnerable_code_files([])
+                if not vulnerable_files:
+                    print("No insecure patterns found — nothing to fix.")
+                    return None
+
+                print(f"Found {len(vulnerable_files)} file(s) with insecure patterns.")
+
+                verify_cmd = self._get_verify_command(build_system, container, workspace)
+                build_error = None
+
+                # ── Patch + Verify loop ───────────────────────────────────────
+                for attempt in range(1, MAX_PATCH_ATTEMPTS + 1):
+                    if attempt > 1:
+                        if self._is_source_compile_error(build_error, build_system):
+                            print(f"Retry {attempt}/{MAX_PATCH_ATTEMPTS}: source errors — re-patching sources...")
+                        else:
+                            print(f"Retry {attempt}/{MAX_PATCH_ATTEMPTS}: build file error — restoring and re-patching...")
+                            self._restore_build_files(container, workspace, build_system, build_file)
+
+                    with tracer.start_as_current_span("sentinel.patch") as patch_span:
+                        patch_span.set_attribute("sentinel.attempt", attempt)
+                        # Pass empty CVE list — LLM gets context from file contents + patterns
+                        if not actor.autonomous_patch([], build_error):
+                            print("Patch generation failed.")
+                            return None
+
+                    if _tel.patch_attempts_counter:
+                        _tel.patch_attempts_counter.add(1, {"build_system": build_system, "attempt": attempt})
+
+                    print(f"Verifying build with: {verify_cmd}")
+                    with tracer.start_as_current_span("sentinel.verify") as verify_span:
+                        t_verify = time.time()
+                        verify = container.exec_run(["bash", "-c", verify_cmd], workdir=workspace)
+                        verify_elapsed = time.time() - t_verify
+                        verify_output = verify.output.decode("utf-8", errors="replace")
+                        verify_span.set_attribute("sentinel.attempt", attempt)
+                        verify_span.set_attribute("sentinel.exit_code", verify.exit_code)
+                        if _tel.verify_duration:
+                            _tel.verify_duration.record(verify_elapsed, {"build_system": build_system, "attempt": str(attempt)})
+
+                    if verify.exit_code == 0:
+                        print("Build verified successfully.")
+                        actor.audit["attempt"] = attempt
+                        actor.audit["build_output"] = verify_output
+
+                        with tracer.start_as_current_span("sentinel.pr_create") as pr_span:
+                            pr_url = self._create_antipattern_pr(
+                                container, fork, actor, workspace
+                            )
+                            pr_span.set_attribute("sentinel.pr_url", pr_url or "")
+                            pr_span.set_attribute("sentinel.success", pr_url is not None)
+
+                        if _tel.pr_opened_counter:
+                            _tel.pr_opened_counter.add(1, {"success": str(pr_url is not None), "build_system": build_system})
+
+                        root_span.set_attribute("sentinel.pr_url", pr_url or "")
+                        return pr_url
+
+                    build_error = self._extract_build_error(verify_output)
+                    print(f"Build failed (attempt {attempt}/{MAX_PATCH_ATTEMPTS}):\n{build_error}")
+
+                print(f"Build still failing after {MAX_PATCH_ATTEMPTS} attempts — giving up.")
+                return None
+            finally:
+                elapsed = time.time() - t0
+                if _tel.remediation_duration:
+                    _tel.remediation_duration.record(elapsed, {"build_system": build_system if build_system else "unknown"})
+                tracker.print_report()
+                container.stop()
+                container.remove()
+
     # ── Scanning ──────────────────────────────────────────────────────────────
 
     def _scan_internal(self, container, workspace="/home/agent/workspace", build_system=None):
@@ -451,3 +622,90 @@ class RemediationFactory:
         if container.exec_run("test -f gradlew", workdir=workspace).exit_code == 0:
             return "./gradlew compileJava"
         return "gradle compileJava"
+
+    # ── Anti-pattern PR creation ───────────────────────────────────────────────
+
+    def _create_antipattern_pr(self, container, fork, actor, workspace: str) -> str | None:
+        """Create a PR for anti-pattern fixes (no specific CVE IDs)."""
+        from datetime import datetime
+        gh_token = self.gh_token
+        ts = datetime.utcnow().strftime("%m%d-%H%M")
+        new_branch = f"fix/antipatterns-{ts}"
+
+        container.exec_run("git config --global user.email 'agent@sentinel.ai'", workdir=workspace)
+        container.exec_run("git config --global user.name 'Sentinel Agent'", workdir=workspace)
+        container.exec_run(f"git checkout -b {new_branch}", workdir=workspace)
+        container.exec_run("git add .", workdir=workspace)
+        container.exec_run("git commit -m 'Security: Fix insecure code anti-patterns'", workdir=workspace)
+
+        auth_url = fork.clone_url.replace("https://", f"https://{gh_token}@")
+        push = container.exec_run(f"git push {auth_url} {new_branch} --force", workdir=workspace)
+        if push.exit_code != 0:
+            print(f"Push failed: {push.output.decode()}")
+            return None
+
+        parent_repo = fork.parent if fork.parent else fork
+        a = actor.audit
+        build_out = (a.get("build_output") or "").strip()
+        build_snippet = "\n".join(build_out.splitlines()[-30:]) if build_out else "(no output captured)"
+        attempt_str = f"{a.get('attempt', 1)} / {MAX_PATCH_ATTEMPTS}"
+        lang = "Python 3 + pip" if actor.build_system == "python" else (
+            f"JDK 17 + {'Maven' if actor.build_system == 'maven' else 'Gradle'}"
+        )
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+        if a.get("patches_written"):
+            changes_rows = "\n".join(
+                f"| `{f}` | {', '.join(f'`{p}`' for p, files in a.get('patterns_found', {}).items() if f in files) or 'pattern fix'} |"
+                for f in a["patches_written"]
+            )
+            changes_table = f"| File | Anti-Pattern Fixed |\n|------|--------------------|\n{changes_rows}"
+        else:
+            changes_table = "_No source files patched._"
+
+        body = f"""\
+## Automated Anti-Pattern Remediation
+
+This PR was generated by [Sentinel](https://github.com/anupamojha-eng/agentic-remediation-factory), \
+an autonomous security remediation agent.
+
+No specific CVE scan was performed — insecure coding patterns were detected directly
+in source files and patched by the LLM.
+
+---
+
+### Patterns Fixed
+Unsafe deserialization, command injection, weak crypto, XXE, and similar anti-patterns.
+
+### Files Changed
+{changes_table}
+
+### Build Verification
+- **Status:** ✅ Passed
+- **Attempts:** {attempt_str}
+- **Sandbox:** {lang}, isolated Docker container
+
+<details>
+<summary>Build output</summary>
+
+```
+{build_snippet}
+```
+
+</details>
+
+---
+*Generated by Sentinel at {now}*"""
+
+        try:
+            pr = parent_repo.create_pull(
+                title="Security: Fix insecure code anti-patterns",
+                body=body,
+                head=f"{fork.owner.login}:{new_branch}",
+                base=parent_repo.default_branch,
+            )
+            print(f"SUCCESS: PR Created at {pr.html_url}")
+            return pr.html_url
+        except Exception as e:
+            print(f"PR creation failed: {e}")
+            return None
