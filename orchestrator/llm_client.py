@@ -260,7 +260,17 @@ def _strip_json_fences(text: str) -> str:
 
 # ── Main client ────────────────────────────────────────────────────────────────
 
+class _NullKB:
+    """Null-object for KnowledgeBase — used when KB is unavailable or __init__ is bypassed."""
+    def is_available(self) -> bool: return False
+    def get_patterns(self, language: str) -> list: return []
+    def close(self) -> None: pass
+
+
 class SecurityAgentClient:
+    # Class-level default so __new__-based construction (e.g. in tests) still works.
+    _kb: "_NullKB" = _NullKB()
+
     # Well-known GHSA IDs → dangerous call-site grep patterns (Java and Python).
     # Checked first (fast + reliable) before falling back to the LLM for unknowns.
     _KNOWN_PATTERNS: dict = {
@@ -311,8 +321,11 @@ class SecurityAgentClient:
     def __init__(self):
         self.llm = _make_provider()
         self.model_id = self.llm.model_id  # kept for OTel label compatibility
-        from orchestrator.knowledge_base import KnowledgeBase
-        self._kb = KnowledgeBase()
+        try:
+            from knowledge_base import KnowledgeBase
+            self._kb = KnowledgeBase()
+        except Exception:
+            self._kb = _NullKB()
 
     def get_vulnerable_patterns(self, ghsa_ids: list, build_system: str = "maven") -> list:
         """

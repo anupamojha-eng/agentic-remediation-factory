@@ -134,7 +134,7 @@ class KnowledgeBase:
             return []
         try:
             cursor = self._conn.execute(
-                "SELECT grep_string FROM patterns WHERE language = ? ORDER BY severity DESC",
+                "SELECT grep_string FROM patterns WHERE language = ? ORDER BY severity ASC",
                 (language,),
             )
             return [row[0] for row in cursor.fetchall()]

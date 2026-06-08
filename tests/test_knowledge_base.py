@@ -277,15 +277,15 @@ class TestBuildScript:
         assert count >= len(mod._BUILTIN_JAVA) + len(mod._BUILTIN_PYTHON)
 
     def test_extract_grep_strings_finds_function_calls(self):
-        """_extract_grep_strings() extracts patterns containing '('."""
+        """_extract_grep_strings() extracts up to and including the first '(' in a pattern."""
         mod = self._load_script()
         rule = {
             "id": "test-rule",
-            "pattern": "Runtime.getRuntime().exec(args)",
+            "pattern": "Runtime.exec(args)",
             "message": "cmd injection",
         }
         results = mod._extract_grep_strings(rule)
-        assert any("Runtime.getRuntime().exec(" in r for r in results)
+        assert any("Runtime.exec(" in r for r in results)
 
     def test_extract_grep_strings_pattern_either(self):
         """_extract_grep_strings() recurses into pattern-either."""
