@@ -65,6 +65,60 @@ def fix_cve(repo: str, branch: str, llm: str, model: str):
         sys.exit(1)
 
 
+@sentinel.command("fix-antipatterns")
+@click.option("--repo", required=True, help="GitHub repo URL to scan and fix.")
+@click.option("--branch", default="main", show_default=True)
+@click.option(
+    "--language",
+    multiple=True,
+    type=click.Choice(["java", "python"], case_sensitive=False),
+    help="Languages to scan (default: auto-detect from build system).",
+)
+@click.option(
+    "--llm",
+    default=None,
+    type=click.Choice(["anthropic", "gemini", "local"], case_sensitive=False),
+    help="LLM provider.",
+)
+@click.option("--model", default=None, help="Override the default model.")
+def fix_antipatterns(repo: str, branch: str, language, llm: str, model: str):
+    """Detect and fix insecure code patterns without a full CVE scan.
+
+    Scans source files for known dangerous patterns (unsafe deserialization,
+    command injection, weak crypto, XXE, etc.) and patches them via LLM.
+    Does not require OSV scan — useful for repos with no declared CVEs but
+    insecure coding patterns.
+
+    \b
+    Examples:
+      sentinel fix-antipatterns --repo https://github.com/org/repo
+      sentinel fix-antipatterns --repo https://github.com/org/repo --language java
+    """
+    if llm:
+        os.environ["LLM_PROVIDER"] = llm.lower()
+    if model:
+        provider = (llm or os.getenv("LLM_PROVIDER", "")).lower()
+        if provider == "gemini":
+            os.environ["GEMINI_MODEL"] = model
+        elif provider == "local":
+            os.environ["SENTINEL_LOCAL_MODEL"] = model
+        else:
+            os.environ["ANTHROPIC_MODEL"] = model
+
+    _check_prerequisites()
+
+    from factory import RemediationFactory
+    click.echo(f"\n🔍  Scanning {repo} @ {branch} for insecure patterns ...")
+    factory = RemediationFactory()
+    pr_url = factory.execute_antipattern_fix(repo, branch, list(language) or None)
+
+    if pr_url:
+        click.echo(f"\n✅  PR opened: {pr_url}")
+    else:
+        click.echo("\n❌  No anti-patterns found or remediation did not produce a PR. Check output above.", err=True)
+        sys.exit(1)
+
+
 @sentinel.command("scan-org")
 @click.option("--org", required=True, help="GitHub org name (e.g. my-org).")
 @click.option("--severity", multiple=True,
