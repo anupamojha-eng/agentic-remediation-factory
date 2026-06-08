@@ -51,11 +51,18 @@ model_cache = modal.Volume.from_name("sentinel-model-cache", create_if_missing=T
 
 # ── Training function (runs on cloud GPU) ─────────────────────────────────────
 
+_training_mount = modal.Mount.from_local_dir(
+    Path(__file__).parent,          # local: training/
+    remote_path="/root/training",   # container: /root/training/
+)
+
+
 @app.function(
     image=training_image,
     gpu="A100",          # change to "T4" for cheaper (~$0.60/hr, slower)
     timeout=7200,        # 2 hour timeout
     volumes={"/model-cache": model_cache},
+    mounts=[_training_mount],
     secrets=[
         modal.Secret.from_name("hf-token"),       # HF_TOKEN
         modal.Secret.from_name("github-token"),   # GITHUB_TOKEN (for data collection)
@@ -99,6 +106,7 @@ def run_training(
     image=training_image,
     gpu="T4",            # T4 is enough for inference-only evaluation
     timeout=1800,
+    mounts=[_training_mount],
     secrets=[modal.Secret.from_name("hf-token")],
 )
 def run_evaluation(
