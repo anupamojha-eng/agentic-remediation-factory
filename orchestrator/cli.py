@@ -64,14 +64,14 @@ def fix_cve(repo: str, branch: str, llm: str, model: str):
 
 
 @sentinel.command("scan-org")
-@click.option("--org", required=True, help="GitHub org name (e.g. ford-bedrock-platform).")
+@click.option("--org", required=True, help="GitHub org name (e.g. my-org).")
 @click.option("--severity", multiple=True,
               type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"], case_sensitive=False),
               default=["CRITICAL", "HIGH"], show_default=True,
               help="Only report findings at or above this severity.")
 @click.option("--language", multiple=True,
               help="Filter by repo language (e.g. --language java --language python).")
-@click.option("--include", default=None, help="Glob pattern for repo names to include (e.g. 'bedrock-*').")
+@click.option("--include", default=None, help="Glob pattern for repo names to include (e.g. 'api-*').")
 @click.option("--exclude", default=None, help="Glob pattern for repo names to exclude (e.g. '*-test').")
 @click.option("--max-repos", default=50, show_default=True, help="Max repos to scan.")
 @click.option("--create-prs", is_flag=True, default=False,
