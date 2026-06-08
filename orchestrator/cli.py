@@ -34,8 +34,8 @@ def sentinel():
 @click.option(
     "--llm",
     default=None,
-    type=click.Choice(["anthropic", "gemini"], case_sensitive=False),
-    help="LLM provider (default: auto-detect from env).",
+    type=click.Choice(["anthropic", "gemini", "local"], case_sensitive=False),
+    help="LLM provider (default: auto-detect from env). 'local' uses Ollama (no API key needed).",
 )
 @click.option("--model", default=None, help="Override the default model for the chosen provider.")
 def fix_cve(repo: str, branch: str, llm: str, model: str):
@@ -46,6 +46,8 @@ def fix_cve(repo: str, branch: str, llm: str, model: str):
         provider = (llm or os.getenv("LLM_PROVIDER", "")).lower()
         if provider == "gemini":
             os.environ["GEMINI_MODEL"] = model
+        elif provider == "local":
+            os.environ["SENTINEL_LOCAL_MODEL"] = model
         else:
             os.environ["ANTHROPIC_MODEL"] = model
 
@@ -169,8 +171,14 @@ def _check_prerequisites():
     missing = []
     if not os.getenv("GITHUB_TOKEN"):
         missing.append("GITHUB_TOKEN")
-    if not os.getenv("ANTHROPIC_API_KEY") and not os.getenv("GEMINI_API_KEY"):
-        missing.append("ANTHROPIC_API_KEY or GEMINI_API_KEY")
+
+    using_local = (
+        os.getenv("SENTINEL_LOCAL_MODEL")
+        or os.getenv("LLM_PROVIDER", "").lower() == "local"
+    )
+    if not using_local and not os.getenv("ANTHROPIC_API_KEY") and not os.getenv("GEMINI_API_KEY"):
+        missing.append("ANTHROPIC_API_KEY or GEMINI_API_KEY (or set SENTINEL_LOCAL_MODEL for offline)")
+
     if missing:
         click.echo(f"❌  Missing required environment variables: {', '.join(missing)}", err=True)
         click.echo("    Copy .env.example → .env and fill in the values.", err=True)

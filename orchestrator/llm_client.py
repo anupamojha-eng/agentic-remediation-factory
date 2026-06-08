@@ -82,6 +82,76 @@ class _GeminiProvider(_LLMProvider):
         return self.generate(system, combined)
 
 
+class _LocalProvider(_LLMProvider):
+    """Ollama-backed local inference — no API key required.
+
+    Set SENTINEL_LOCAL_MODEL=hf.co/anupamojha/sentinel-patcher-7b (or any
+    Ollama model tag) to use this provider. Ollama must be running locally
+    (or at OLLAMA_HOST).
+    """
+
+    def __init__(self):
+        import requests as _requests
+        self._requests = _requests
+        self.model_id = os.getenv("SENTINEL_LOCAL_MODEL", "")
+        base = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        self._url = base.rstrip("/") + "/v1/chat/completions"
+        self._verify_reachable()
+        print(f"  [LLM] Local provider (Ollama): {self.model_id}")
+
+    def _verify_reachable(self):
+        try:
+            self._requests.get(
+                self._url.replace("/v1/chat/completions", "/api/tags"),
+                timeout=3,
+            )
+        except self._requests.exceptions.ConnectionError:
+            host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+            raise RuntimeError(
+                f"Ollama is not running at {host}. "
+                "Start it with: ollama serve"
+            )
+
+    def generate(self, system: str, user: str, stage: str = "patch") -> str:
+        payload = {
+            "model": self.model_id,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.1,
+            "stream": False,
+        }
+        try:
+            resp = self._requests.post(self._url, json=payload, timeout=300)
+        except self._requests.exceptions.ConnectionError:
+            raise RuntimeError(
+                "Ollama stopped responding mid-request. "
+                "Check `ollama serve` logs."
+            )
+
+        if resp.status_code == 404:
+            raise RuntimeError(
+                f"Model '{self.model_id}' not found in Ollama. "
+                f"Pull it first: ollama pull {self.model_id}"
+            )
+        resp.raise_for_status()
+
+        data = resp.json()
+        usage = data.get("usage", {})
+        self.record_tokens(
+            usage.get("prompt_tokens", 0),
+            usage.get("completion_tokens", 0),
+            stage=stage,
+        )
+        return data["choices"][0]["message"]["content"]
+
+    def generate_cached(self, system: str, cacheable_user: str,
+                        volatile_user: str = "", stage: str = "patch") -> str:
+        combined = cacheable_user + ("\n\n" + volatile_user if volatile_user else "")
+        return self.generate(system, combined, stage=stage)
+
+
 class _AnthropicProvider(_LLMProvider):
     def __init__(self):
         import anthropic as _sdk
@@ -140,18 +210,32 @@ class _AnthropicProvider(_LLMProvider):
 
 
 def _make_provider() -> _LLMProvider:
-    """Select provider from env vars. Anthropic wins when both keys are set."""
+    """Select provider from env vars.
+
+    Priority:
+      1. SENTINEL_LOCAL_MODEL set → _LocalProvider (offline, no API key)
+      2. LLM_PROVIDER=local       → _LocalProvider
+      3. LLM_PROVIDER=anthropic   → _AnthropicProvider
+      4. LLM_PROVIDER=gemini      → _GeminiProvider
+      5. ANTHROPIC_API_KEY set    → _AnthropicProvider (default cloud)
+      6. GEMINI_API_KEY set       → _GeminiProvider
+    """
     forced = os.getenv("LLM_PROVIDER", "").lower()
+    has_local = bool(os.getenv("SENTINEL_LOCAL_MODEL"))
     has_anthropic = bool(os.getenv("ANTHROPIC_API_KEY"))
     has_gemini = bool(os.getenv("GEMINI_API_KEY"))
 
+    if forced == "local" or (not forced and has_local):
+        return _LocalProvider()
     if forced == "anthropic" or (not forced and has_anthropic):
         return _AnthropicProvider()
     if forced == "gemini" or (not forced and has_gemini):
         return _GeminiProvider()
     raise ValueError(
-        "No LLM API key found. Set ANTHROPIC_API_KEY (Claude) or GEMINI_API_KEY (Gemini). "
-        "Optionally set LLM_PROVIDER=anthropic|gemini to force a provider when both are set."
+        "No LLM provider configured. Options:\n"
+        "  Offline: SENTINEL_LOCAL_MODEL=hf.co/anupamojha/sentinel-patcher-7b  (requires: ollama serve)\n"
+        "  Cloud:   ANTHROPIC_API_KEY=sk-...  or  GEMINI_API_KEY=...\n"
+        "  Force:   LLM_PROVIDER=local|anthropic|gemini"
     )
 
 
