@@ -32,6 +32,8 @@ app = modal.App("sentinel-patcher-training")
 # Build the training image once — cached between runs
 training_image = (
     modal.Image.debian_slim(python_version="3.11")
+    # llama.cpp build deps — pre-installed so unsloth never hits the interactive prompt
+    .apt_install("cmake", "curl", "git", "libcurl4-openssl-dev", "build-essential")
     .pip_install(
         "unsloth[colab-new]",
         "trl>=0.7.0",
@@ -40,7 +42,17 @@ training_image = (
         "huggingface_hub>=0.22.0",
         "requests",
         "torch",
+        # Pre-install GGUF conversion deps so unsloth doesn't try `uv pip install` at runtime
+        "gguf",
+        "mistral_common",
         extra_index_url="https://download.pytorch.org/whl/cu121",
+    )
+    # Pre-build llama.cpp — unsloth looks for llama-quantize in the repo root, not build/bin/
+    .run_commands(
+        "git clone --depth=1 https://github.com/ggerganov/llama.cpp /root/llama.cpp"
+        " && cd /root/llama.cpp && cmake -B build && cmake --build build --config Release -j$(nproc)"
+        " && cp /root/llama.cpp/build/bin/llama-quantize /root/llama.cpp/llama-quantize"
+        " && echo 'llama-quantize ready'"
     )
     .add_local_file(
         Path(__file__).parent / "train.py",
@@ -88,6 +100,9 @@ def run_training(
 
     # Point HuggingFace cache at the persistent volume
     os.environ["HF_HOME"] = "/model-cache/hf"
+
+    # llama.cpp was pre-built at /root/llama.cpp — unsloth looks in cwd
+    os.chdir("/root")
 
     # Import and run training
     sys.path.insert(0, "/root")
@@ -192,12 +207,15 @@ def main(
     eval_data     = eval_path.read_text() if eval_path.exists() else ""
 
     # Step 2: Train on Modal A100
-    print(f"\n[2/4] Launching training on Modal A100...")
-    result = run_training.remote(
+    # .spawn() fires the function independently — safe to disconnect locally
+    print(f"\n[2/4] Launching training on Modal A100 (detached)...")
+    training_call = run_training.spawn(
         training_data=training_data,
         hf_repo=hf_repo,
         push_to_hub=not no_push,
     )
+    print(f"  Training launched. Waiting for result (safe to Ctrl+C — job continues in cloud)...")
+    result = training_call.get()
     print(f"  Training complete: {result}")
 
     if no_push:
@@ -207,11 +225,12 @@ def main(
     # Step 3: Evaluate the new model
     if eval_data:
         print(f"\n[3/4] Evaluating model quality...")
-        eval_result = run_evaluation.remote(
+        eval_call = run_evaluation.spawn(
             eval_data=eval_data,
             hf_repo=hf_repo,
             threshold=threshold,
         )
+        eval_result = eval_call.get()
         print(f"  pass@1: {eval_result['pass_rate']:.1%} "
               f"(threshold: {threshold:.0%}) — "
               f"{'✅ PASSED' if eval_result['passed_ci'] else '❌ FAILED'}")
