@@ -48,11 +48,14 @@ training_image = (
         extra_index_url="https://download.pytorch.org/whl/cu121",
     )
     # Pre-build llama.cpp — unsloth looks for llama-quantize in the repo root, not build/bin/
+    # Also install llama.cpp's own requirements.txt so convert_hf_to_gguf.py gets the
+    # exact gguf package version it was written against.
     .run_commands(
         "git clone --depth=1 https://github.com/ggerganov/llama.cpp /root/llama.cpp"
         " && cd /root/llama.cpp && cmake -B build && cmake --build build --config Release -j$(nproc)"
         " && cp /root/llama.cpp/build/bin/llama-quantize /root/llama.cpp/llama-quantize"
-        " && echo 'llama-quantize ready'"
+        " && pip install -r /root/llama.cpp/requirements.txt"
+        " && echo 'llama.cpp ready'"
     )
     .add_local_file(
         Path(__file__).parent / "train.py",
